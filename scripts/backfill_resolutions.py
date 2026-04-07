@@ -13,6 +13,64 @@ from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+DEFAULT_EVENT_SLUG_PREFIXES = ["btc-updown-5m", "eth-updown-5m"]
+
+
+def backfill_resolutions(
+    config_path: str = "configs/base.yaml",
+    input_glob: str = "data/processed/crypto_5m_orderbook_summary_*.parquet",
+    event_limit: int | None = None,
+    event_duration_seconds: float = 300.0,
+    settlement_delay_seconds: float = 60.0,
+    include_unresolved: bool = False,
+    event_slug_prefixes: List[str] | None = None,
+) -> dict[str, int | str]:
+    """Backfill BTC/ETH 5m resolution labels for collected event slugs."""
+    event_slug_prefixes = event_slug_prefixes or DEFAULT_EVENT_SLUG_PREFIXES
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    event_slugs = _load_event_slugs(
+        input_glob=input_glob,
+        event_slug_prefixes=event_slug_prefixes,
+        event_limit=event_limit,
+        event_duration_seconds=event_duration_seconds,
+        settlement_delay_seconds=settlement_delay_seconds,
+    )
+    if not event_slugs:
+        logger.warning("No event slugs found from %s", input_glob)
+        return {"event_slugs": 0, "raw_records": 0, "resolution_rows": 0, "run_timestamp": ""}
+
+    client = PolymarketRESTClient(
+        gamma_url=config["api"]["gamma_url"],
+        clob_url=config["api"]["clob_url"],
+    )
+    pipeline = IngestionPipeline(
+        client=client,
+        raw_dir=config["data"]["raw_dir"],
+        processed_dir=config["data"]["processed_dir"],
+    )
+
+    logger.info("Backfilling resolution labels for %s event slugs", len(event_slugs))
+    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_for_event_slugs(
+        event_slugs=event_slugs,
+        event_slug_prefixes=event_slug_prefixes,
+        resolved_only=not include_unresolved,
+    )
+    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    pipeline.save_crypto_5m_resolutions(
+        raw_records=raw_records,
+        resolution_rows=resolution_rows,
+        run_timestamp=run_timestamp,
+    )
+    return {
+        "event_slugs": len(event_slugs),
+        "raw_records": len(raw_records),
+        "resolution_rows": len(resolution_rows),
+        "run_timestamp": run_timestamp,
+    }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -46,46 +104,19 @@ def main() -> None:
     parser.add_argument(
         "--event-slug-prefixes",
         nargs="+",
-        default=["btc-updown-5m", "eth-updown-5m"],
+        default=DEFAULT_EVENT_SLUG_PREFIXES,
         help="Only backfill events whose slugs start with these prefixes",
     )
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-
-    event_slugs = _load_event_slugs(
+    backfill_resolutions(
+        config_path=args.config,
         input_glob=args.input_glob,
-        event_slug_prefixes=args.event_slug_prefixes,
         event_limit=args.event_limit,
         event_duration_seconds=args.event_duration_seconds,
         settlement_delay_seconds=args.settlement_delay_seconds,
-    )
-    if not event_slugs:
-        logger.warning("No event slugs found from %s", args.input_glob)
-        return
-
-    client = PolymarketRESTClient(
-        gamma_url=config["api"]["gamma_url"],
-        clob_url=config["api"]["clob_url"],
-    )
-    pipeline = IngestionPipeline(
-        client=client,
-        raw_dir=config["data"]["raw_dir"],
-        processed_dir=config["data"]["processed_dir"],
-    )
-
-    logger.info("Backfilling resolution labels for %s event slugs", len(event_slugs))
-    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_for_event_slugs(
-        event_slugs=event_slugs,
+        include_unresolved=args.include_unresolved,
         event_slug_prefixes=args.event_slug_prefixes,
-        resolved_only=not args.include_unresolved,
-    )
-    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    pipeline.save_crypto_5m_resolutions(
-        raw_records=raw_records,
-        resolution_rows=resolution_rows,
-        run_timestamp=run_timestamp,
     )
 
 

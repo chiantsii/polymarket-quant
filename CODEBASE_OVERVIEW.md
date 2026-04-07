@@ -672,6 +672,39 @@ BTC/ETH 5m resolution label backfill tool。
 - `--include-unresolved`
 - `--event-slug-prefixes`
 
+### `scripts/run_window_capture.py`
+
+Aligned full-window capture orchestrator。
+
+用途：
+
+- 提供單一入口，同時呼叫 `collect_orderbooks.py` 與 `collect_spot_prices.py` 的 collector 函數。
+- 預設等待下一個完整 5 分鐘 UTC 窗口，讓 Polymarket orderbook 與 Coinbase spot price 用同一個 `window_start` 對齊。
+- 使用 `ThreadPoolExecutor` 同時執行 orderbook collector 與 spot collector；不是 `asyncio`，因此保留目前同步 `requests` 架構。
+- 支援 `--windows`，例如 `--windows 2` 會連續抓兩個完整 5 分鐘窗口。
+- 可選擇 `--backfill`，在收集完成後等待 `--settlement-wait-seconds` 再呼叫 resolution backfill。
+- 這是雲端手動操作時最方便的入口；底層資料仍分別輸出成 orderbook、spot、resolution parquet。
+
+常用指令：
+
+```bash
+python scripts/run_window_capture.py --interval-seconds 1
+python scripts/run_window_capture.py --interval-seconds 1 --windows 2
+python scripts/run_window_capture.py --interval-seconds 1 --windows 2 --backfill --settlement-wait-seconds 600
+```
+
+參數：
+
+- `--config`
+- `--interval-seconds`
+- `--event-duration-seconds`
+- `--window-start`
+- `--windows`
+- `--backfill`
+- `--settlement-wait-seconds`
+- `--event-slug-prefixes`
+- `--series-slugs`
+
 ### `scripts/train_calibration.py`
 
 Calibration training skeleton。

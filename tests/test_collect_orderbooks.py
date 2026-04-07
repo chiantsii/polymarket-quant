@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 
+import pytest
+
+from scripts.run_window_capture import run_window_capture
 from scripts.windowing import next_window_start, resolve_full_window
 
 
@@ -21,3 +24,8 @@ def test_resolve_full_window_builds_btc_eth_event_slugs() -> None:
     assert int(full_window.start.timestamp()) == 1775575800
     assert int(full_window.end.timestamp()) == 1775576100
     assert full_window.event_slugs == ["btc-updown-5m-1775575800", "eth-updown-5m-1775575800"]
+
+
+def test_run_window_capture_rejects_zero_windows() -> None:
+    with pytest.raises(ValueError):
+        run_window_capture(windows=0)
