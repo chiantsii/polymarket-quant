@@ -702,6 +702,44 @@ python scripts/run_window_capture.py --interval-seconds 1 --windows 2
 - `--event-slug-prefixes`
 - `--series-slugs`
 
+### `scripts/replay_pricing.py`
+
+Offline pricing replay tool。
+
+用途：
+
+- 讀取已收集的 `crypto_5m_orderbook_summary_*.parquet`、`crypto_spot_ticks_*.parquet`、`crypto_5m_resolutions_*.parquet`。
+- 使用 `collected_at` 做 as-of time alignment，預設只使用 orderbook timestamp 之前最近的 spot tick，避免 lookahead bias。
+- 用現有 pricing stack 重播每個歷史 snapshot 的 fair probability、fair token price、buy/sell edge、toxicity score 與 signal。
+- 預設用 Coinbase first observed spot in event window 當 reference price proxy；這不是 Polymarket/Chainlink 官方結算價。
+- 如果 resolution label 已存在，會合併 `is_winner` 並計算 `brier_component`。
+- 輸出 `crypto_5m_pricing_replay_*.parquet` 與 `crypto_5m_pricing_replay_latest.parquet`。
+
+常用指令：
+
+```bash
+python scripts/replay_pricing.py --pricing-method monte_carlo --n-samples 1000
+python scripts/replay_pricing.py --pricing-method importance_sampling --n-samples 1000
+python scripts/replay_pricing.py --pricing-method stratified --n-samples 1000
+```
+
+參數：
+
+- `--orderbook-glob`
+- `--spot-glob`
+- `--resolution-glob`
+- `--output-dir`
+- `--pricing-method`
+- `--n-samples`
+- `--min-edge`
+- `--max-toxicity`
+- `--min-depth`
+- `--spot-tolerance-seconds`
+- `--event-duration-seconds`
+- `--fallback-volatility-per-sqrt-second`
+- `--use-particle-filter`
+- `--include-latest`
+
 ### `scripts/train_calibration.py`
 
 Calibration training skeleton。
