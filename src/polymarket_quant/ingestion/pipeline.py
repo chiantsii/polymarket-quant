@@ -174,6 +174,7 @@ class IngestionPipeline:
         series_slugs: List[str],
         event_limit: int = 1,
         event_slug_prefixes: Optional[List[str]] = None,
+        event_slugs: Optional[List[str]] = None,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Collect one live orderbook snapshot batch for BTC/ETH Up or Down 5m markets."""
         collected_at = datetime.now(timezone.utc).isoformat()
@@ -183,14 +184,21 @@ class IngestionPipeline:
         now = datetime.now(timezone.utc)
 
         for series_slug in series_slugs:
-            events = self._get_series_events(
-                series_slug,
-                event_limit=event_limit,
-                closed_only=False,
-                current_only=True,
-                event_slug_prefixes=event_slug_prefixes,
-                now=now,
-            )
+            if event_slugs:
+                events = [
+                    {"slug": event_slug, "closed": False}
+                    for event_slug in event_slugs
+                    if self._series_slug_from_event_slug(event_slug) == series_slug
+                ]
+            else:
+                events = self._get_series_events(
+                    series_slug,
+                    event_limit=event_limit,
+                    closed_only=False,
+                    current_only=True,
+                    event_slug_prefixes=event_slug_prefixes,
+                    now=now,
+                )
             open_events = [event for event in events if event.get("closed") is not True]
             for event in open_events:
                 event_detail = self.client.fetch_event_by_slug(event["slug"])

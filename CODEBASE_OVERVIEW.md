@@ -606,6 +606,8 @@ Live BTC/ETH 5m orderbook collector。
 用途：
 
 - 每隔 N 秒抓一次 open BTC/ETH 5m Up/Down token orderbook。
+- 預設 `duration` 模式會依照 `--duration-seconds` 收集。
+- `--mode full-window` 會等待下一個尚未開始的完整 5 分鐘窗口，從該窗口開始收集並在窗口結束時停止。
 - 累積 raw snapshots、level rows、summary rows。
 - 最後寫到 `data/raw` 與 `data/processed`。
 - 只負責 Polymarket orderbook，不計算 mispricing signal。
@@ -613,6 +615,7 @@ Live BTC/ETH 5m orderbook collector。
 參數：
 
 - `--config`
+- `--mode`: `duration` 或 `full-window`
 - `--interval-seconds`
 - `--duration-seconds`
 - `--event-limit`
@@ -805,7 +808,7 @@ Market-making simulation entry point skeleton。
 
 ```text
 venv/bin/pytest
-20 passed
+21 passed
 ```
 
 語法編譯：
