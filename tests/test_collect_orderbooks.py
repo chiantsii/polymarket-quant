@@ -1,55 +1,23 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from scripts.collect_orderbooks import _next_events_by_series
-
-
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+from scripts.collect_orderbooks import _next_window_start, _resolve_full_window
 
 
-class MockSeriesClient:
-    def __init__(self, now: datetime):
-        self.now = now
+def test_next_window_start_uses_next_five_minute_boundary() -> None:
+    now = datetime.fromtimestamp(1775575585, tz=timezone.utc)
 
-    def fetch_series(self, slug: str):
-        prefix = "btc-updown-5m" if slug.startswith("btc") else "eth-updown-5m"
-        return [
-            {
-                "slug": slug,
-                "events": [
-                    {
-                        "slug": f"{prefix}-current",
-                        "startTime": _iso(self.now - timedelta(minutes=1)),
-                        "endDate": _iso(self.now + timedelta(minutes=4)),
-                        "closed": False,
-                    },
-                    {
-                        "slug": f"{prefix}-next",
-                        "startTime": _iso(self.now + timedelta(minutes=4)),
-                        "endDate": _iso(self.now + timedelta(minutes=9)),
-                        "closed": False,
-                    },
-                    {
-                        "slug": "xrp-updown-5m-next",
-                        "startTime": _iso(self.now + timedelta(minutes=4)),
-                        "endDate": _iso(self.now + timedelta(minutes=9)),
-                        "closed": False,
-                    },
-                ],
-            }
-        ]
+    start = _next_window_start(now, event_duration_seconds=300)
+
+    assert int(start.timestamp()) == 1775575800
 
 
-def test_next_events_by_series_selects_future_complete_window() -> None:
-    now = datetime.now(timezone.utc)
-    client = MockSeriesClient(now)
-
-    events = _next_events_by_series(
-        client=client,
-        series_slugs=["btc-up-or-down-5m", "eth-up-or-down-5m"],
+def test_resolve_full_window_builds_btc_eth_event_slugs() -> None:
+    slugs, start, end = _resolve_full_window(
         event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
-        now=now,
+        event_duration_seconds=300,
+        window_start="1775575800",
     )
 
-    assert events["btc-up-or-down-5m"]["slug"] == "btc-updown-5m-next"
-    assert events["eth-up-or-down-5m"]["slug"] == "eth-updown-5m-next"
+    assert int(start.timestamp()) == 1775575800
+    assert int(end.timestamp()) == 1775576100
+    assert slugs == ["btc-updown-5m-1775575800", "eth-updown-5m-1775575800"]

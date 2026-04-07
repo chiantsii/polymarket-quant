@@ -22,6 +22,13 @@ def main() -> None:
     )
     parser.add_argument("--interval-seconds", type=float, default=5.0, help="Seconds between orderbook polls")
     parser.add_argument("--duration-seconds", type=float, default=300.0, help="Total collection duration")
+    parser.add_argument("--event-duration-seconds", type=int, default=300, help="Full-window event duration")
+    parser.add_argument(
+        "--window-start",
+        type=str,
+        default=None,
+        help="Optional full-window start time as Unix seconds or ISO timestamp",
+    )
     parser.add_argument("--event-limit", type=int, default=1, help="Current events per BTC/ETH series to scan")
     parser.add_argument(
         "--event-slug-prefixes",
@@ -52,15 +59,20 @@ def main() -> None:
 
     window_slugs = None
     if args.mode == "full-window":
-        window_slugs, window_end = _wait_for_next_full_window(
-            client=client,
-            series_slugs=args.series_slugs,
+        window_slugs, window_start, window_end = _resolve_full_window(
             event_slug_prefixes=args.event_slug_prefixes,
-            poll_seconds=args.interval_seconds,
+            event_duration_seconds=args.event_duration_seconds,
+            window_start=args.window_start,
         )
+        _wait_until(window_start, args.interval_seconds)
         args.duration_seconds = max(0.0, (window_end - datetime.now(timezone.utc)).total_seconds())
         args.event_limit = len(window_slugs)
-        logger.info("Collecting full event window for %s until %s", window_slugs, window_end.isoformat())
+        logger.info(
+            "Collecting full event window %s -> %s for %s",
+            window_start.isoformat(),
+            window_end.isoformat(),
+            window_slugs,
+        )
 
     run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     deadline = time.monotonic() + args.duration_seconds
@@ -109,73 +121,48 @@ def main() -> None:
         )
 
 
-def _wait_for_next_full_window(
-    client: PolymarketRESTClient,
-    series_slugs: list[str],
+def _resolve_full_window(
     event_slug_prefixes: list[str],
-    poll_seconds: float,
-) -> tuple[list[str], datetime]:
-    """Wait until BTC and ETH next-window events become current, then return their slugs/end time."""
-    target_slugs: list[str] | None = None
-    target_start: datetime | None = None
-    target_end: datetime | None = None
+    event_duration_seconds: int,
+    window_start: str | None = None,
+) -> tuple[list[str], datetime, datetime]:
+    """Resolve the full 5m event slugs from the UTC event-start timestamp."""
+    start_time = _parse_window_start(window_start) if window_start else _next_window_start(
+        datetime.now(timezone.utc),
+        event_duration_seconds,
+    )
+    end_time = datetime.fromtimestamp(start_time.timestamp() + event_duration_seconds, tz=timezone.utc)
+    start_epoch = int(start_time.timestamp())
+    slugs = [f"{prefix}-{start_epoch}" for prefix in event_slug_prefixes]
+    return slugs, start_time, end_time
 
+
+def _next_window_start(now: datetime, event_duration_seconds: int) -> datetime:
+    now = now.astimezone(timezone.utc)
+    now_epoch = int(now.timestamp())
+    next_epoch = ((now_epoch // event_duration_seconds) + 1) * event_duration_seconds
+    return datetime.fromtimestamp(next_epoch, tz=timezone.utc)
+
+
+def _parse_window_start(value: str) -> datetime:
+    if value.isdigit():
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        raise ValueError("--window-start must be Unix seconds or an ISO timestamp")
+    return parsed
+
+
+def _wait_until(start_time: datetime, poll_seconds: float) -> None:
     while True:
         now = datetime.now(timezone.utc)
-        upcoming = _next_events_by_series(client, series_slugs, event_slug_prefixes, now)
-        if len(upcoming) == len(series_slugs):
-            starts = [_parse_iso_datetime(event.get("startTime") or event.get("startDate")) for event in upcoming.values()]
-            ends = [_parse_iso_datetime(event.get("endDate")) for event in upcoming.values()]
-            if all(starts) and all(ends):
-                latest_start = max(starts)
-                earliest_end = min(ends)
-                if target_slugs is None:
-                    target_slugs = [event["slug"] for event in upcoming.values()]
-                    target_start = latest_start
-                    target_end = earliest_end
-                    logger.info("Next complete window is %s -> %s for %s", target_start, target_end, target_slugs)
-
-                if target_start <= now < target_end:
-                    return target_slugs, target_end
-
-                sleep_seconds = min(max((target_start - now).total_seconds(), 0.0), max(poll_seconds, 1.0))
-                logger.info("Waiting %.2f seconds for next complete window to start", sleep_seconds)
-                time.sleep(sleep_seconds)
-                continue
-
-        logger.info("Waiting for next BTC/ETH 5m window metadata.")
-        time.sleep(max(poll_seconds, 1.0))
-
-
-def _next_events_by_series(
-    client: PolymarketRESTClient,
-    series_slugs: list[str],
-    event_slug_prefixes: list[str],
-    now: datetime,
-) -> dict[str, dict]:
-    events_by_series = {}
-    for series_slug in series_slugs:
-        series_payloads = client.fetch_series(series_slug)
-        if not series_payloads:
-            continue
-        events = series_payloads[0].get("events", [])
-        candidates = [
-            event
-            for event in events
-            if event.get("closed") is not True
-            and isinstance(event.get("slug"), str)
-            and any(event["slug"].startswith(prefix) for prefix in event_slug_prefixes)
-        ]
-        candidates = [
-            event
-            for event in candidates
-            if (_parse_iso_datetime(event.get("startTime") or event.get("startDate")) or now) >= now
-            and (_parse_iso_datetime(event.get("endDate")) or now) > now
-        ]
-        candidates = sorted(candidates, key=lambda event: event.get("startTime") or event.get("startDate") or "")
-        if candidates:
-            events_by_series[series_slug] = candidates[0]
-    return events_by_series
+        seconds_to_start = (start_time - now).total_seconds()
+        if seconds_to_start <= 0:
+            return
+        sleep_seconds = min(seconds_to_start, max(poll_seconds, 1.0))
+        logger.info("Waiting %.2f seconds for full window to start at %s", sleep_seconds, start_time.isoformat())
+        time.sleep(sleep_seconds)
 
 
 def _parse_iso_datetime(value) -> datetime | None:
