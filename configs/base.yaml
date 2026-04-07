@@ -1,0 +1,12 @@
+project:
+  name: "Polymarket_Alpha_v1"
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+
+api:
+  gamma_url: "https://gamma-api.polymarket.com"
+  clob_url: "https://clob.polymarket.com"
+
+# Backtest & Risk settings omitted for brevity...
