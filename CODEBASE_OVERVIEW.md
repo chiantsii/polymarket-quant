@@ -634,14 +634,19 @@ Live BTC/ETH spot price collector。
 用途：
 
 - 每隔 N 秒抓一次 Coinbase BTC/ETH ticker。
+- 支援 `--mode full-window`，可和 orderbook collector 等待同一個 5 分鐘 UTC 窗口。
+- 支援 `--window-start`，可手動指定和 orderbook collector 相同的窗口起點。
 - 只負責 underlying spot price，不抓 Polymarket orderbook，不計算 signal。
 - 輸出 `crypto_spot_ticks_*.parquet` 與 `crypto_spot_ticks_latest.parquet`。
 
 參數：
 
 - `--config`
+- `--mode`: `duration` 或 `full-window`
 - `--interval-seconds`
 - `--duration-seconds`
+- `--event-duration-seconds`
+- `--window-start`
 
 ### `scripts/backfill_resolutions.py`
 

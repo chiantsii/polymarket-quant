@@ -15,8 +15,21 @@ logger = get_logger(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect live BTC/ETH spot price time-series data.")
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config file")
+    parser.add_argument(
+        "--mode",
+        choices=["duration", "full-window"],
+        default="duration",
+        help="Use duration mode or wait for the next complete 5m event window",
+    )
     parser.add_argument("--interval-seconds", type=float, default=2.0, help="Seconds between spot polls")
     parser.add_argument("--duration-seconds", type=float, default=300.0, help="Total collection duration")
+    parser.add_argument("--event-duration-seconds", type=int, default=300, help="Full-window event duration")
+    parser.add_argument(
+        "--window-start",
+        type=str,
+        default=None,
+        help="Optional full-window start time as Unix seconds or ISO timestamp",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -26,6 +39,22 @@ def main() -> None:
     data_config = config.get("data", {})
     spot_products = config.get("spot", {}).get("products", {"BTC": "BTC-USD", "ETH": "ETH-USD"})
     client = CoinbaseSpotPriceClient(base_url=api_config.get("coinbase_url", "https://api.exchange.coinbase.com"))
+
+    if args.mode == "full-window":
+        from windowing import resolve_full_window, wait_until
+
+        full_window = resolve_full_window(
+            event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
+            event_duration_seconds=args.event_duration_seconds,
+            window_start=args.window_start,
+        )
+        wait_until(full_window.start, args.interval_seconds, logger)
+        args.duration_seconds = max(0.0, (full_window.end - datetime.now(timezone.utc)).total_seconds())
+        logger.info(
+            "Collecting spot prices for full event window %s -> %s",
+            full_window.start.isoformat(),
+            full_window.end.isoformat(),
+        )
 
     run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     deadline = time.monotonic() + args.duration_seconds
