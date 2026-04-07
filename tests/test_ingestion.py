@@ -1,7 +1,12 @@
+from datetime import datetime, timedelta, timezone
 from polymarket_quant.ingestion.client import BasePolymarketClient
 from polymarket_quant.ingestion.pipeline import IngestionPipeline
 from pathlib import Path
 import json
+
+
+def _utc_iso(dt):
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 class MockPolymarketClient(BasePolymarketClient):
     def fetch_active_markets(self, limit=100):
@@ -65,31 +70,45 @@ class MockPolymarketClient(BasePolymarketClient):
 
 class OpenMarketMockPolymarketClient(MockPolymarketClient):
     def fetch_series(self, slug):
+        now = datetime.now(timezone.utc)
         return [{
             "slug": slug,
-            "events": [{
-                "id": "event_open",
-                "slug": f"{slug}-open-event",
-                "title": "Bitcoin Up or Down - Open Test",
-                "startTime": "2026-01-01T00:00:00Z",
-                "closed": False,
-            }]
+            "events": [
+                {
+                    "id": "event_future",
+                    "slug": f"{slug}-future-event",
+                    "title": "Bitcoin Up or Down - Future Test",
+                    "startTime": _utc_iso(now + timedelta(minutes=5)),
+                    "endDate": _utc_iso(now + timedelta(minutes=10)),
+                    "closed": False,
+                },
+                {
+                    "id": "event_open",
+                    "slug": f"{slug}-open-event",
+                    "title": "Bitcoin Up or Down - Open Test",
+                    "startTime": _utc_iso(now - timedelta(minutes=1)),
+                    "endDate": _utc_iso(now + timedelta(minutes=4)),
+                    "closed": False,
+                },
+            ]
         }]
 
     def fetch_event_by_slug(self, slug):
+        now = datetime.now(timezone.utc)
         return {
             "id": "event_open",
             "slug": slug,
             "title": "Bitcoin Up or Down - Open Test",
-            "startTime": "2026-01-01T00:00:00Z",
-            "endDate": "2026-01-01T00:05:00Z",
+            "startTime": _utc_iso(now - timedelta(minutes=1)),
+            "endDate": _utc_iso(now + timedelta(minutes=4)),
             "closed": False,
             "markets": [{
                 "id": "mkt_open",
                 "conditionId": "cond_open",
                 "outcomes": '["Up", "Down"]',
                 "outcomePrices": '["0.51", "0.49"]',
-                "endDate": "2026-01-01T00:05:00Z",
+                "eventStartTime": _utc_iso(now - timedelta(minutes=1)),
+                "endDate": _utc_iso(now + timedelta(minutes=4)),
                 "closed": False,
                 "acceptingOrders": True,
                 "clobTokenIds": '["tok_up", "tok_down"]',

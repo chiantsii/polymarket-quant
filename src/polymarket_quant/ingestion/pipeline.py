@@ -179,9 +179,16 @@ class IngestionPipeline:
         raw_snapshots = []
         level_rows = []
         summary_rows = []
+        now = datetime.now(timezone.utc)
 
         for series_slug in series_slugs:
-            events = self._get_series_events(series_slug, event_limit=event_limit, closed_only=False)
+            events = self._get_series_events(
+                series_slug,
+                event_limit=event_limit,
+                closed_only=False,
+                current_only=True,
+                now=now,
+            )
             open_events = [event for event in events if event.get("closed") is not True]
             for event in open_events:
                 event_detail = self.client.fetch_event_by_slug(event["slug"])
@@ -190,6 +197,8 @@ class IngestionPipeline:
 
                 for market in event_detail.get("markets", []):
                     if market.get("closed") is True:
+                        continue
+                    if not self._is_current_time_window(market, now):
                         continue
 
                     for token in self._extract_contracts(market):
@@ -316,6 +325,8 @@ class IngestionPipeline:
         series_slug: str,
         event_limit: int,
         closed_only: bool = True,
+        current_only: bool = False,
+        now: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         series_payloads = self.client.fetch_series(series_slug)
         if not series_payloads:
@@ -325,8 +336,41 @@ class IngestionPipeline:
         events = series_payloads[0].get("events", [])
         if closed_only:
             events = [event for event in events if event.get("closed") is True]
+        if current_only:
+            current_time = now or datetime.now(timezone.utc)
+            events = [
+                event
+                for event in events
+                if event.get("closed") is not True and self._is_current_time_window(event, current_time)
+            ]
         events = sorted(events, key=lambda event: event.get("startTime") or event.get("startDate") or "")
         return events[-event_limit:]
+
+    def _is_current_time_window(self, payload: Dict[str, Any], now: datetime) -> bool:
+        start_time = self._parse_iso_datetime(
+            payload.get("eventStartTime") or payload.get("startTime") or payload.get("startDate")
+        )
+        end_time = self._parse_iso_datetime(payload.get("endDate"))
+        if start_time is None or end_time is None:
+            return False
+        return start_time <= now <= end_time
+
+    def _parse_iso_datetime(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _price_history_rows(
         self,
