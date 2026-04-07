@@ -637,13 +637,16 @@ Live BTC/ETH spot price collector。
 - `--interval-seconds`
 - `--duration-seconds`
 
-### `scripts/collect_resolutions.py`
+### `scripts/backfill_resolutions.py`
 
-BTC/ETH 5m resolution label collector。
+BTC/ETH 5m resolution label backfill tool。
 
 用途：
 
-- 週期性掃描最近 closed 的 `btc-updown-5m*` / `eth-updown-5m*` events。
+- 讀取已收集的 orderbook summary parquet，例如 `crypto_5m_orderbook_summary_*.parquet`。
+- 從資料中取出 unique `event_slug`。
+- 只對實際收過的 `btc-updown-5m*` / `eth-updown-5m*` events 回查 Gamma API。
+- 預設跳過尚未超過 `event_start + 300s + 60s` 的 slugs，避免查到還沒 resolved 的市場。
 - 解析 Up/Down token 的 `outcome_price` 與 `is_winner`。
 - 預設只儲存已能推論 winner 的 rows；可用 `--include-unresolved` 保留 pending rows。
 - 輸出 `crypto_5m_resolutions_*.parquet` 與 `crypto_5m_resolutions_latest.parquet`。
@@ -651,12 +654,12 @@ BTC/ETH 5m resolution label collector。
 參數：
 
 - `--config`
-- `--interval-seconds`
-- `--duration-seconds`
+- `--input-glob`
 - `--event-limit`
+- `--event-duration-seconds`
+- `--settlement-delay-seconds`
 - `--include-unresolved`
 - `--event-slug-prefixes`
-- `--series-slugs`
 
 ### `scripts/train_calibration.py`
 
@@ -802,7 +805,7 @@ Market-making simulation entry point skeleton。
 
 ```text
 venv/bin/pytest
-18 passed
+20 passed
 ```
 
 語法編譯：

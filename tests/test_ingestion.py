@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from polymarket_quant.ingestion.client import BasePolymarketClient
 from polymarket_quant.ingestion.pipeline import IngestionPipeline
+from scripts.backfill_resolutions import _load_event_slugs
 from pathlib import Path
 import json
 
@@ -284,21 +285,21 @@ def test_live_crypto_5m_orderbook_collection(tmp_path):
     assert (processed_dir / "crypto_5m_orderbook_summary_test.parquet").exists()
 
 
-def test_crypto_5m_resolution_collection(tmp_path):
+def test_crypto_5m_resolution_backfill_for_event_slugs(tmp_path):
     raw_dir = tmp_path / "raw"
     processed_dir = tmp_path / "processed"
 
     client = ClosedMarketMockPolymarketClient()
     pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
 
-    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_once(
-        series_slugs=["btc-up-or-down-5m"],
-        event_limit=1,
+    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_for_event_slugs(
+        event_slugs=["btc-updown-5m-closed-event", "xrp-updown-5m-closed-event"],
         event_slug_prefixes=["btc-updown-5m"],
     )
 
     assert len(raw_records) == 1
     assert len(resolution_rows) == 2
+    assert raw_records[0]["series_slug"] == "btc-up-or-down-5m"
     assert {row["outcome_name"] for row in resolution_rows} == {"Up", "Down"}
     assert {row["is_winner"] for row in resolution_rows} == {0, 1}
     assert all(row["event_slug"].startswith("btc-updown-5m") for row in resolution_rows)
@@ -312,3 +313,44 @@ def test_crypto_5m_resolution_collection(tmp_path):
     assert (raw_dir / "crypto_5m_resolutions_raw_test.json").exists()
     assert (processed_dir / "crypto_5m_resolutions_test.parquet").exists()
     assert (processed_dir / "crypto_5m_resolutions_latest.parquet").exists()
+
+
+def test_backfill_loads_event_slugs_from_orderbook_files(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "crypto_5m_orderbook_summary_test.parquet"
+    pd.DataFrame(
+        {
+            "event_slug": [
+                "btc-updown-5m-1",
+                "btc-updown-5m-1",
+                "eth-updown-5m-1",
+                "xrp-updown-5m-1",
+            ]
+        }
+    ).to_parquet(path, index=False)
+
+    event_slugs = _load_event_slugs(
+        input_glob=str(tmp_path / "crypto_5m_orderbook_summary_*.parquet"),
+        event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
+        now=datetime.fromtimestamp(1_000, tz=timezone.utc),
+    )
+
+    assert event_slugs == ["btc-updown-5m-1", "eth-updown-5m-1"]
+
+
+def test_backfill_skips_slugs_that_are_not_ready_for_resolution(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "crypto_5m_orderbook_summary_test.parquet"
+    pd.DataFrame({"event_slug": ["btc-updown-5m-1000", "btc-updown-5m-2000"]}).to_parquet(path, index=False)
+
+    event_slugs = _load_event_slugs(
+        input_glob=str(tmp_path / "crypto_5m_orderbook_summary_*.parquet"),
+        event_slug_prefixes=["btc-updown-5m"],
+        event_duration_seconds=300,
+        settlement_delay_seconds=60,
+        now=datetime.fromtimestamp(2300, tz=timezone.utc),
+    )
+
+    assert event_slugs == ["btc-updown-5m-1000"]

@@ -271,42 +271,41 @@ class IngestionPipeline:
         logger.info(f"Saved {len(levels_df)} orderbook level rows to {levels_path}")
         logger.info(f"Saved {len(summary_df)} orderbook summary rows to {summary_path}")
 
-    def collect_crypto_5m_resolutions_once(
+    def collect_crypto_5m_resolutions_for_event_slugs(
         self,
-        series_slugs: List[str],
-        event_limit: int = 20,
+        event_slugs: List[str],
         event_slug_prefixes: Optional[List[str]] = None,
         resolved_only: bool = True,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Collect winner labels for recently closed BTC/ETH Up or Down 5m events."""
+        """Collect winner labels for explicitly requested BTC/ETH 5m event slugs."""
         resolved_at = datetime.now(timezone.utc).isoformat()
         raw_records = []
         resolution_rows = []
+        seen_event_slugs = set()
 
-        for series_slug in series_slugs:
-            events = self._get_series_events(
-                series_slug,
-                event_limit=event_limit,
-                closed_only=True,
-                current_only=False,
-                event_slug_prefixes=event_slug_prefixes,
-            )
-            for event in events:
-                event_detail = self.client.fetch_event_by_slug(event["slug"])
-                if not event_detail:
-                    continue
+        for event_slug in event_slugs:
+            if not event_slug or event_slug in seen_event_slugs:
+                continue
+            if event_slug_prefixes and not self._matches_event_slug_prefix(event_slug, event_slug_prefixes):
+                continue
+            seen_event_slugs.add(event_slug)
 
-                raw_records.append({"series_slug": series_slug, "event": event_detail, "resolved_at": resolved_at})
-                for market in event_detail.get("markets", []):
-                    market_rows = self._crypto_5m_resolution_rows(
-                        series_slug=series_slug,
-                        event=event_detail,
-                        market=market,
-                        resolved_at=resolved_at,
-                    )
-                    if resolved_only:
-                        market_rows = [row for row in market_rows if row["is_winner"] is not None]
-                    resolution_rows.extend(market_rows)
+            event_detail = self.client.fetch_event_by_slug(event_slug)
+            if not event_detail:
+                continue
+
+            series_slug = self._series_slug_from_event_slug(event_slug)
+            raw_records.append({"series_slug": series_slug, "event": event_detail, "resolved_at": resolved_at})
+            for market in event_detail.get("markets", []):
+                market_rows = self._crypto_5m_resolution_rows(
+                    series_slug=series_slug,
+                    event=event_detail,
+                    market=market,
+                    resolved_at=resolved_at,
+                )
+                if resolved_only:
+                    market_rows = [row for row in market_rows if row["is_winner"] is not None]
+                resolution_rows.extend(market_rows)
 
         return raw_records, resolution_rows
 
@@ -319,6 +318,9 @@ class IngestionPipeline:
         """Persist recently collected resolution labels."""
         if not raw_records:
             logger.warning("No crypto 5m resolution records to save.")
+            return
+        if not resolution_rows:
+            logger.warning("No crypto 5m resolution labels to save.")
             return
 
         run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -420,6 +422,13 @@ class IngestionPipeline:
         if not isinstance(slug, str):
             return False
         return any(slug.startswith(prefix) for prefix in prefixes)
+
+    def _series_slug_from_event_slug(self, event_slug: str) -> str:
+        if event_slug.startswith("btc"):
+            return "btc-up-or-down-5m"
+        if event_slug.startswith("eth"):
+            return "eth-up-or-down-5m"
+        return ""
 
     def _is_current_time_window(self, payload: Dict[str, Any], now: datetime) -> bool:
         start_time = self._parse_iso_datetime(
