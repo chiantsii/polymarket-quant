@@ -124,6 +124,53 @@ class OpenMarketMockPolymarketClient(MockPolymarketClient):
             }],
         }
 
+
+class ClosedMarketMockPolymarketClient(MockPolymarketClient):
+    def fetch_series(self, slug):
+        event_prefix = "btc-updown-5m" if slug.startswith("btc") else "eth-updown-5m"
+        return [{
+            "slug": slug,
+            "events": [
+                {
+                    "id": "event_wrong_prefix",
+                    "slug": "xrp-updown-5m-closed-event",
+                    "title": "XRP Up or Down - Closed Test",
+                    "startTime": "2026-01-01T00:00:00Z",
+                    "endDate": "2026-01-01T00:05:00Z",
+                    "closed": True,
+                },
+                {
+                    "id": "event_closed",
+                    "slug": f"{event_prefix}-closed-event",
+                    "title": "Bitcoin Up or Down - Closed Test",
+                    "startTime": "2026-01-01T00:00:00Z",
+                    "endDate": "2026-01-01T00:05:00Z",
+                    "closed": True,
+                },
+            ]
+        }]
+
+    def fetch_event_by_slug(self, slug):
+        return {
+            "id": "event_closed",
+            "slug": slug,
+            "title": "Bitcoin Up or Down - Closed Test",
+            "startTime": "2026-01-01T00:00:00Z",
+            "endDate": "2026-01-01T00:05:00Z",
+            "closed": True,
+            "markets": [{
+                "id": "mkt_closed",
+                "conditionId": "cond_closed",
+                "outcomes": '["Up", "Down"]',
+                "outcomePrices": '["0", "1"]',
+                "eventStartTime": "2026-01-01T00:00:00Z",
+                "endDate": "2026-01-01T00:05:00Z",
+                "closed": True,
+                "clobTokenIds": '["tok_up", "tok_down"]',
+            }],
+        }
+
+
 def test_pipeline_normalization(tmp_path):
     raw_dir = tmp_path / "raw"
     processed_dir = tmp_path / "processed"
@@ -235,3 +282,33 @@ def test_live_crypto_5m_orderbook_collection(tmp_path):
     assert (raw_dir / "crypto_5m_orderbooks_raw_test.json").exists()
     assert (processed_dir / "crypto_5m_orderbook_levels_test.parquet").exists()
     assert (processed_dir / "crypto_5m_orderbook_summary_test.parquet").exists()
+
+
+def test_crypto_5m_resolution_collection(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+
+    client = ClosedMarketMockPolymarketClient()
+    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
+
+    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_once(
+        series_slugs=["btc-up-or-down-5m"],
+        event_limit=1,
+        event_slug_prefixes=["btc-updown-5m"],
+    )
+
+    assert len(raw_records) == 1
+    assert len(resolution_rows) == 2
+    assert {row["outcome_name"] for row in resolution_rows} == {"Up", "Down"}
+    assert {row["is_winner"] for row in resolution_rows} == {0, 1}
+    assert all(row["event_slug"].startswith("btc-updown-5m") for row in resolution_rows)
+
+    pipeline.save_crypto_5m_resolutions(
+        raw_records=raw_records,
+        resolution_rows=resolution_rows,
+        run_timestamp="test",
+    )
+
+    assert (raw_dir / "crypto_5m_resolutions_raw_test.json").exists()
+    assert (processed_dir / "crypto_5m_resolutions_test.parquet").exists()
+    assert (processed_dir / "crypto_5m_resolutions_latest.parquet").exists()

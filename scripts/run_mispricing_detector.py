@@ -1,8 +1,6 @@
 import argparse
-import json
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -11,6 +9,7 @@ import yaml
 from polymarket_quant.ingestion.client import PolymarketRESTClient
 from polymarket_quant.ingestion.pipeline import IngestionPipeline
 from polymarket_quant.ingestion.spot import CoinbaseSpotPriceClient
+from polymarket_quant.ingestion.storage import save_json_and_parquet_rows
 from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
 from polymarket_quant.utils.logger import get_logger
 
@@ -147,8 +146,8 @@ def main() -> None:
         )
         _save_rows(
             rows=spot_rows,
-            raw_dir=Path(data_config["raw_dir"]),
-            processed_dir=Path(data_config["processed_dir"]),
+            raw_dir=data_config["raw_dir"],
+            processed_dir=data_config["processed_dir"],
             raw_name=f"crypto_spot_ticks_raw_{run_timestamp}.json",
             latest_raw_name="crypto_spot_ticks_raw_latest.json",
             parquet_name=f"crypto_spot_ticks_{run_timestamp}.parquet",
@@ -156,8 +155,8 @@ def main() -> None:
         )
         _save_rows(
             rows=signal_rows,
-            raw_dir=Path(data_config["raw_dir"]),
-            processed_dir=Path(data_config["processed_dir"]),
+            raw_dir=data_config["raw_dir"],
+            processed_dir=data_config["processed_dir"],
             raw_name=f"crypto_5m_mispricing_signals_raw_{run_timestamp}.json",
             latest_raw_name="crypto_5m_mispricing_signals_raw_latest.json",
             parquet_name=f"crypto_5m_mispricing_signals_{run_timestamp}.parquet",
@@ -167,28 +166,22 @@ def main() -> None:
 
 def _save_rows(
     rows: List[Dict[str, Any]],
-    raw_dir: Path,
-    processed_dir: Path,
+    raw_dir: str,
+    processed_dir: str,
     raw_name: str,
     latest_raw_name: str,
     parquet_name: str,
     latest_parquet_name: str,
 ) -> None:
-    if not rows:
-        logger.warning("No rows to save for %s", parquet_name)
-        return
-
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    with open(raw_dir / raw_name, "w") as f:
-        json.dump(rows, f)
-    with open(raw_dir / latest_raw_name, "w") as f:
-        json.dump(rows, f)
-
-    df = pd.DataFrame(rows)
-    df.to_parquet(processed_dir / parquet_name, index=False)
-    df.to_parquet(processed_dir / latest_parquet_name, index=False)
-    logger.info("Saved %s rows to %s", len(df), processed_dir / parquet_name)
+    save_json_and_parquet_rows(
+        rows=rows,
+        raw_dir=raw_dir,
+        processed_dir=processed_dir,
+        raw_name=raw_name,
+        latest_raw_name=latest_raw_name,
+        parquet_name=parquet_name,
+        latest_parquet_name=latest_parquet_name,
+    )
 
 
 def _fetch_reference_prices(

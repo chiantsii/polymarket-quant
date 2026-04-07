@@ -608,6 +608,7 @@ Live BTC/ETH 5m orderbook collector。
 - 每隔 N 秒抓一次 open BTC/ETH 5m Up/Down token orderbook。
 - 累積 raw snapshots、level rows、summary rows。
 - 最後寫到 `data/raw` 與 `data/processed`。
+- 只負責 Polymarket orderbook，不計算 mispricing signal。
 
 參數：
 
@@ -615,9 +616,47 @@ Live BTC/ETH 5m orderbook collector。
 - `--interval-seconds`
 - `--duration-seconds`
 - `--event-limit`
+- `--event-slug-prefixes`
 - `--series-slugs`
 
 這是目前最接近真正 orderbook time-series 訓練資料的收集工具。
+
+### `scripts/collect_spot_prices.py`
+
+Live BTC/ETH spot price collector。
+
+用途：
+
+- 每隔 N 秒抓一次 Coinbase BTC/ETH ticker。
+- 只負責 underlying spot price，不抓 Polymarket orderbook，不計算 signal。
+- 輸出 `crypto_spot_ticks_*.parquet` 與 `crypto_spot_ticks_latest.parquet`。
+
+參數：
+
+- `--config`
+- `--interval-seconds`
+- `--duration-seconds`
+
+### `scripts/collect_resolutions.py`
+
+BTC/ETH 5m resolution label collector。
+
+用途：
+
+- 週期性掃描最近 closed 的 `btc-updown-5m*` / `eth-updown-5m*` events。
+- 解析 Up/Down token 的 `outcome_price` 與 `is_winner`。
+- 預設只儲存已能推論 winner 的 rows；可用 `--include-unresolved` 保留 pending rows。
+- 輸出 `crypto_5m_resolutions_*.parquet` 與 `crypto_5m_resolutions_latest.parquet`。
+
+參數：
+
+- `--config`
+- `--interval-seconds`
+- `--duration-seconds`
+- `--event-limit`
+- `--include-unresolved`
+- `--event-slug-prefixes`
+- `--series-slugs`
 
 ### `scripts/train_calibration.py`
 
@@ -680,6 +719,7 @@ Market-making simulation entry point skeleton。
 - orderbook snapshot ingestion 能抽出 Yes/No token，寫 summary parquet。
 - crypto 5m history ingestion 能產生 Up/Down price history rows 與 winner label。
 - live crypto 5m orderbook collector 能產生 raw snapshots、orderbook level rows、summary rows。
+- crypto 5m resolution collector 能產生 Up/Down winner label rows。
 
 ### `tests/test_pricing_models.py`
 
@@ -711,6 +751,12 @@ Market-making simulation entry point skeleton。
 
 - `CoinbaseSpotPriceClient.fetch_spot_ticker()` 抓 BTC/ETH spot last price、bid、ask、volume、exchange time。
 - `CoinbaseSpotPriceClient.fetch_reference_price()` 用 event slug 的 Unix start timestamp 抓 Coinbase 1-minute candle open，作為 BTC/ETH 5m Up/Down event 的近似 reference price。
+
+### `src/polymarket_quant/ingestion/storage.py`
+
+小型存檔 helper。
+
+- `save_json_and_parquet_rows()` 將 normalized rows 同時寫成 raw JSON 與 parquet，並維護 `latest` 檔案。
 
 ### `src/polymarket_quant/signals/mispricing.py`
 
@@ -756,7 +802,7 @@ Market-making simulation entry point skeleton。
 
 ```text
 venv/bin/pytest
-15 passed
+18 passed
 ```
 
 語法編譯：
@@ -776,6 +822,7 @@ passed
 - BTC/ETH 5m price history ingestion。
 - BTC/ETH 5m live orderbook collector。
 - BTC/ETH spot ticker/reference price ingestion。
+- BTC/ETH 5m resolution label ingestion。
 - 即時 BTC/ETH 5m mispricing detector。
 - pricing models: Monte Carlo、importance sampling、stratified MC、particle filter、ABM。
 - Brier score 與 calibration diagnostics。

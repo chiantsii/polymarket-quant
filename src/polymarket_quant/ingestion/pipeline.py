@@ -271,6 +271,67 @@ class IngestionPipeline:
         logger.info(f"Saved {len(levels_df)} orderbook level rows to {levels_path}")
         logger.info(f"Saved {len(summary_df)} orderbook summary rows to {summary_path}")
 
+    def collect_crypto_5m_resolutions_once(
+        self,
+        series_slugs: List[str],
+        event_limit: int = 20,
+        event_slug_prefixes: Optional[List[str]] = None,
+        resolved_only: bool = True,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Collect winner labels for recently closed BTC/ETH Up or Down 5m events."""
+        resolved_at = datetime.now(timezone.utc).isoformat()
+        raw_records = []
+        resolution_rows = []
+
+        for series_slug in series_slugs:
+            events = self._get_series_events(
+                series_slug,
+                event_limit=event_limit,
+                closed_only=True,
+                current_only=False,
+                event_slug_prefixes=event_slug_prefixes,
+            )
+            for event in events:
+                event_detail = self.client.fetch_event_by_slug(event["slug"])
+                if not event_detail:
+                    continue
+
+                raw_records.append({"series_slug": series_slug, "event": event_detail, "resolved_at": resolved_at})
+                for market in event_detail.get("markets", []):
+                    market_rows = self._crypto_5m_resolution_rows(
+                        series_slug=series_slug,
+                        event=event_detail,
+                        market=market,
+                        resolved_at=resolved_at,
+                    )
+                    if resolved_only:
+                        market_rows = [row for row in market_rows if row["is_winner"] is not None]
+                    resolution_rows.extend(market_rows)
+
+        return raw_records, resolution_rows
+
+    def save_crypto_5m_resolutions(
+        self,
+        raw_records: List[Dict[str, Any]],
+        resolution_rows: List[Dict[str, Any]],
+        run_timestamp: Optional[str] = None,
+    ) -> None:
+        """Persist recently collected resolution labels."""
+        if not raw_records:
+            logger.warning("No crypto 5m resolution records to save.")
+            return
+
+        run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        raw_path = self.raw_dir / f"crypto_5m_resolutions_raw_{run_timestamp}.json"
+        self._write_json(raw_path, raw_records)
+        self._write_json(self.raw_dir / "crypto_5m_resolutions_raw_latest.json", raw_records)
+
+        df = pd.DataFrame(resolution_rows)
+        processed_path = self.processed_dir / f"crypto_5m_resolutions_{run_timestamp}.parquet"
+        df.to_parquet(processed_path, index=False)
+        df.to_parquet(self.processed_dir / "crypto_5m_resolutions_latest.parquet", index=False)
+        logger.info(f"Saved {len(df)} crypto 5m resolution rows to {processed_path}")
+
     def _write_json(self, path: Path, payload: Any) -> None:
         with open(path, "w") as f:
             json.dump(payload, f)
@@ -447,6 +508,44 @@ class IngestionPipeline:
             "closed": market.get("closed", event.get("closed")),
             "accepting_orders": market.get("acceptingOrders"),
         }
+
+    def _crypto_5m_resolution_rows(
+        self,
+        series_slug: str,
+        event: Dict[str, Any],
+        market: Dict[str, Any],
+        resolved_at: str,
+    ) -> List[Dict[str, Any]]:
+        outcome_prices = self._loads_json_list(market.get("outcomePrices"))
+        outcomes = self._loads_json_list(market.get("outcomes"))
+        rows = []
+        for token in self._extract_contracts(market):
+            token_id = token["token_id"]
+            if not token_id:
+                continue
+
+            outcome_name = token["outcome_name"]
+            outcome_price = self._lookup_outcome_price(outcomes, outcome_prices, outcome_name)
+            rows.append(
+                {
+                    "series_slug": series_slug,
+                    "asset": "BTC" if series_slug.startswith("btc") else "ETH",
+                    "event_id": event.get("id"),
+                    "event_slug": event.get("slug"),
+                    "event_title": event.get("title"),
+                    "market_id": market.get("id"),
+                    "condition_id": market.get("conditionId", market.get("condition_id")),
+                    "token_id": token_id,
+                    "outcome_name": outcome_name,
+                    "market_start_time": market.get("eventStartTime", event.get("startTime")),
+                    "market_end_time": market.get("endDate", event.get("endDate")),
+                    "closed": market.get("closed", event.get("closed")),
+                    "outcome_price": outcome_price,
+                    "is_winner": self._infer_winner(outcome_price),
+                    "resolved_at": resolved_at,
+                }
+            )
+        return rows
 
     def _orderbook_level_rows(
         self,
