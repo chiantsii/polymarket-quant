@@ -703,13 +703,60 @@ Market-making simulation entry point skeleton。
 - 正 inventory 時 bid/ask 會下移。
 - toxicity 高時 spread 會變寬。
 
+### `src/polymarket_quant/ingestion/spot.py`
+
+新增的 underlying spot price adapter。
+
+目前支援 Coinbase Exchange public REST ticker：
+
+- `CoinbaseSpotPriceClient.fetch_spot_ticker()` 抓 BTC/ETH spot last price、bid、ask、volume、exchange time。
+- `CoinbaseSpotPriceClient.fetch_reference_price()` 用 event slug 的 Unix start timestamp 抓 Coinbase 1-minute candle open，作為 BTC/ETH 5m Up/Down event 的近似 reference price。
+
+### `src/polymarket_quant/signals/mispricing.py`
+
+新增即時 mispricing detector。
+
+它會把 Polymarket orderbook summary、Coinbase spot ticker、event reference price 串起來：
+
+- 用 Monte Carlo / importance sampling / stratified MC 估 `fair_up_probability`。
+- 可選用 particle filter 平滑即時 probability path。
+- 用 spot jump、spread widening、volatility surge 產生 `toxicity_score`。
+- 對 Up/Down token 分別計算 `buy_edge`、`sell_edge`、`fair_token_price`。
+- 依照 edge、toxicity、depth 輸出 `BUY`、`SELL` 或 `HOLD`。
+
+### `scripts/run_mispricing_detector.py`
+
+新增 live mispricing detector 入口。
+
+每次 poll 會：
+
+- 抓 BTC/ETH Coinbase spot ticker。
+- 抓目前 BTC/ETH 5m event 的 Up/Down orderbook。
+- 用 event slug 末尾 timestamp 抓 reference candle open。
+- 產出 orderbook parquet、spot ticker parquet、mispricing signal parquet。
+
+主要輸出：
+
+- `data/processed/crypto_spot_ticks_latest.parquet`
+- `data/processed/crypto_5m_mispricing_signals_latest.parquet`
+
+### `tests/test_mispricing.py`
+
+測試即時 mispricing detector。
+
+覆蓋：
+
+- 當 Up token ask 明顯低於 fair price 時會產生 `BUY`。
+- reference source 可以使用 `coinbase_1m_candle_open`。
+- toxicity 超過設定上限時會強制 `HOLD`。
+
 ## 目前已通過的驗證
 
 最近一次完整測試結果：
 
 ```text
 venv/bin/pytest
-13 passed
+15 passed
 ```
 
 語法編譯：
@@ -728,6 +775,8 @@ passed
 - market metadata ingestion。
 - BTC/ETH 5m price history ingestion。
 - BTC/ETH 5m live orderbook collector。
+- BTC/ETH spot ticker/reference price ingestion。
+- 即時 BTC/ETH 5m mispricing detector。
 - pricing models: Monte Carlo、importance sampling、stratified MC、particle filter、ABM。
 - Brier score 與 calibration diagnostics。
 - mock-based ingestion/pricing/schema/MM tests。
@@ -761,4 +810,3 @@ passed
    - join pricing output、market outcome、time-to-resolution、asset、orderbook features。
 
 5. 再把 signal、risk、execution、backtest 串起來。
-
