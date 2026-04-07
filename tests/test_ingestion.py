@@ -71,12 +71,21 @@ class MockPolymarketClient(BasePolymarketClient):
 class OpenMarketMockPolymarketClient(MockPolymarketClient):
     def fetch_series(self, slug):
         now = datetime.now(timezone.utc)
+        event_prefix = "btc-updown-5m" if slug.startswith("btc") else "eth-updown-5m"
         return [{
             "slug": slug,
             "events": [
                 {
+                    "id": "event_wrong_prefix",
+                    "slug": "xrp-updown-5m-open-event",
+                    "title": "XRP Up or Down - Open Test",
+                    "startTime": _utc_iso(now - timedelta(minutes=1)),
+                    "endDate": _utc_iso(now + timedelta(minutes=4)),
+                    "closed": False,
+                },
+                {
                     "id": "event_future",
-                    "slug": f"{slug}-future-event",
+                    "slug": f"{event_prefix}-future-event",
                     "title": "Bitcoin Up or Down - Future Test",
                     "startTime": _utc_iso(now + timedelta(minutes=5)),
                     "endDate": _utc_iso(now + timedelta(minutes=10)),
@@ -84,7 +93,7 @@ class OpenMarketMockPolymarketClient(MockPolymarketClient):
                 },
                 {
                     "id": "event_open",
-                    "slug": f"{slug}-open-event",
+                    "slug": f"{event_prefix}-open-event",
                     "title": "Bitcoin Up or Down - Open Test",
                     "startTime": _utc_iso(now - timedelta(minutes=1)),
                     "endDate": _utc_iso(now + timedelta(minutes=4)),
@@ -205,6 +214,7 @@ def test_live_crypto_5m_orderbook_collection(tmp_path):
     raw_snapshots, level_rows, summary_rows = pipeline.collect_crypto_5m_orderbooks_once(
         series_slugs=["btc-up-or-down-5m"],
         event_limit=1,
+        event_slug_prefixes=["btc-updown-5m"],
     )
 
     assert len(raw_snapshots) == 2

@@ -16,7 +16,13 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config file")
     parser.add_argument("--interval-seconds", type=float, default=5.0, help="Seconds between orderbook polls")
     parser.add_argument("--duration-seconds", type=float, default=300.0, help="Total collection duration")
-    parser.add_argument("--event-limit", type=int, default=3, help="Open events per BTC/ETH series to scan")
+    parser.add_argument("--event-limit", type=int, default=1, help="Current events per BTC/ETH series to scan")
+    parser.add_argument(
+        "--event-slug-prefixes",
+        nargs="+",
+        default=["btc-updown-5m", "eth-updown-5m"],
+        help="Only collect events whose slugs start with these prefixes",
+    )
     parser.add_argument(
         "--series-slugs",
         nargs="+",
@@ -57,6 +63,7 @@ def main() -> None:
             batch_raw, batch_levels, batch_summary = pipeline.collect_crypto_5m_orderbooks_once(
                 series_slugs=args.series_slugs,
                 event_limit=args.event_limit,
+                event_slug_prefixes=args.event_slug_prefixes,
             )
             raw_snapshots.extend(batch_raw)
             level_rows.extend(batch_levels)

@@ -173,6 +173,7 @@ class IngestionPipeline:
         self,
         series_slugs: List[str],
         event_limit: int = 1,
+        event_slug_prefixes: Optional[List[str]] = None,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Collect one live orderbook snapshot batch for BTC/ETH Up or Down 5m markets."""
         collected_at = datetime.now(timezone.utc).isoformat()
@@ -187,6 +188,7 @@ class IngestionPipeline:
                 event_limit=event_limit,
                 closed_only=False,
                 current_only=True,
+                event_slug_prefixes=event_slug_prefixes,
                 now=now,
             )
             open_events = [event for event in events if event.get("closed") is not True]
@@ -326,6 +328,7 @@ class IngestionPipeline:
         event_limit: int,
         closed_only: bool = True,
         current_only: bool = False,
+        event_slug_prefixes: Optional[List[str]] = None,
         now: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         series_payloads = self.client.fetch_series(series_slug)
@@ -336,6 +339,12 @@ class IngestionPipeline:
         events = series_payloads[0].get("events", [])
         if closed_only:
             events = [event for event in events if event.get("closed") is True]
+        if event_slug_prefixes:
+            events = [
+                event
+                for event in events
+                if self._matches_event_slug_prefix(event.get("slug"), event_slug_prefixes)
+            ]
         if current_only:
             current_time = now or datetime.now(timezone.utc)
             events = [
@@ -345,6 +354,11 @@ class IngestionPipeline:
             ]
         events = sorted(events, key=lambda event: event.get("startTime") or event.get("startDate") or "")
         return events[-event_limit:]
+
+    def _matches_event_slug_prefix(self, slug: Any, prefixes: List[str]) -> bool:
+        if not isinstance(slug, str):
+            return False
+        return any(slug.startswith(prefix) for prefix in prefixes)
 
     def _is_current_time_window(self, payload: Dict[str, Any], now: datetime) -> bool:
         start_time = self._parse_iso_datetime(
