@@ -26,6 +26,7 @@ def collect_orderbooks(
     duration_seconds: float = 300.0,
     event_duration_seconds: int = 300,
     window_start: str | None = None,
+    run_timestamp: str | None = None,
     event_limit: int = 1,
     event_slug_prefixes: list[str] | None = None,
     series_slugs: list[str] | None = None,
@@ -56,6 +57,7 @@ def collect_orderbooks(
         )
         wait_until(full_window.start, interval_seconds, logger)
         duration_seconds = max(0.0, (full_window.end - datetime.now(timezone.utc)).total_seconds())
+        run_timestamp = run_timestamp or full_window.start.strftime("%Y%m%d_%H%M%S")
         window_slugs = full_window.event_slugs
         event_limit = len(window_slugs)
         logger.info(
@@ -65,7 +67,7 @@ def collect_orderbooks(
             window_slugs,
         )
 
-    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     deadline = time.monotonic() + duration_seconds
     raw_snapshots = []
     level_rows = []
@@ -160,6 +162,7 @@ def main() -> None:
         duration_seconds=args.duration_seconds,
         event_duration_seconds=args.event_duration_seconds,
         window_start=args.window_start,
+        run_timestamp=None,
         event_limit=args.event_limit,
         event_slug_prefixes=args.event_slug_prefixes,
         series_slugs=args.series_slugs,

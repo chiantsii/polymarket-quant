@@ -23,19 +23,20 @@ def save_json_and_parquet_rows(
     latest_parquet_name: str,
 ) -> None:
     """Persist normalized rows as raw JSON plus analytics-ready parquet."""
-    if not rows:
-        logger.warning("No rows to save for %s", parquet_name)
-        return
-
     raw_path = Path(raw_dir)
     processed_path = Path(processed_dir)
     raw_path.mkdir(parents=True, exist_ok=True)
-    processed_path.mkdir(parents=True, exist_ok=True)
 
     with open(raw_path / raw_name, "w") as f:
         json.dump(rows, f)
     with open(raw_path / latest_raw_name, "w") as f:
         json.dump(rows, f)
+
+    if not rows:
+        logger.warning("No rows to save for %s; wrote empty raw JSON only", parquet_name)
+        return
+
+    processed_path.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame(rows)
     df.to_parquet(processed_path / parquet_name, index=False)

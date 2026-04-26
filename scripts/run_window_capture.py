@@ -1,5 +1,5 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from typing import Any
 
 from polymarket_quant.utils.logger import get_logger
@@ -14,6 +14,70 @@ except ModuleNotFoundError:
     from scripts.windowing import resolve_full_window
 
 logger = get_logger(__name__)
+
+
+def _resolve_window_capture_plan(
+    event_slug_prefixes: list[str],
+    event_duration_seconds: int,
+    window_start: str | None,
+    window_index: int,
+    last_planned_window_start_epoch: int | None = None,
+) -> dict[str, Any]:
+    skipped_window_count = 0
+
+    if window_start is not None:
+        first_window = resolve_full_window(
+            event_slug_prefixes=event_slug_prefixes,
+            event_duration_seconds=event_duration_seconds,
+            window_start=window_start,
+        )
+        target_start_epoch = int(first_window.start.timestamp()) + (window_index * event_duration_seconds)
+    else:
+        latest_window = resolve_full_window(
+            event_slug_prefixes=event_slug_prefixes,
+            event_duration_seconds=event_duration_seconds,
+        )
+        latest_start_epoch = int(latest_window.start.timestamp())
+        if last_planned_window_start_epoch is None:
+            target_start_epoch = latest_start_epoch
+        else:
+            desired_start_epoch = last_planned_window_start_epoch + event_duration_seconds
+            target_start_epoch = max(desired_start_epoch, latest_start_epoch)
+            skipped_window_count = max(0, (target_start_epoch - desired_start_epoch) // event_duration_seconds)
+
+    current_window_start = str(target_start_epoch)
+    full_window = resolve_full_window(
+        event_slug_prefixes=event_slug_prefixes,
+        event_duration_seconds=event_duration_seconds,
+        window_start=current_window_start,
+    )
+    return {
+        "window_index": window_index,
+        "window_start": current_window_start,
+        "run_timestamp": full_window.start.strftime("%Y%m%d_%H%M%S"),
+        "full_window": full_window,
+        "skipped_window_count": skipped_window_count,
+    }
+
+
+def _log_queued_window_capture(plan: dict[str, Any], windows: int) -> None:
+    if plan["skipped_window_count"] > 0:
+        logger.warning(
+            "Capture scheduler fell behind; skipped %s stale full-window(s) and resumed at %s -> %s (%s)",
+            plan["skipped_window_count"],
+            plan["full_window"].start.isoformat(),
+            plan["full_window"].end.isoformat(),
+            plan["full_window"].event_slugs,
+        )
+
+    logger.info(
+        "Queueing window capture %s/%s for %s -> %s (%s)",
+        plan["window_index"] + 1,
+        windows,
+        plan["full_window"].start.isoformat(),
+        plan["full_window"].end.isoformat(),
+        plan["full_window"].event_slugs,
+    )
 
 
 def run_window_capture(
@@ -32,44 +96,67 @@ def run_window_capture(
     event_slug_prefixes = event_slug_prefixes or DEFAULT_EVENT_SLUG_PREFIXES
     series_slugs = series_slugs or DEFAULT_SERIES_SLUGS
 
-    first_window = resolve_full_window(
-        event_slug_prefixes=event_slug_prefixes,
-        event_duration_seconds=event_duration_seconds,
-        window_start=window_start,
-    )
-    first_start_epoch = int(first_window.start.timestamp())
-    results = []
+    queued_window_count = min(2, windows)
+    next_window_index = 0
+    results_by_index: dict[int, dict[str, Any]] = {}
+    last_planned_window_start_epoch: int | None = None
 
-    for window_index in range(windows):
-        current_start_epoch = first_start_epoch + window_index * event_duration_seconds
-        current_window_start = str(current_start_epoch)
-        full_window = resolve_full_window(
-            event_slug_prefixes=event_slug_prefixes,
-            event_duration_seconds=event_duration_seconds,
-            window_start=current_window_start,
-        )
+    with ThreadPoolExecutor(max_workers=queued_window_count) as executor:
+        future_to_index = {}
 
-        logger.info(
-            "Starting window capture %s/%s for %s -> %s (%s)",
-            window_index + 1,
-            windows,
-            full_window.start.isoformat(),
-            full_window.end.isoformat(),
-            full_window.event_slugs,
-        )
-
-        results.append(
-            _run_single_window_capture(
+        while next_window_index < queued_window_count:
+            plan = _resolve_window_capture_plan(
+                event_slug_prefixes=event_slug_prefixes,
+                event_duration_seconds=event_duration_seconds,
+                window_start=window_start,
+                window_index=next_window_index,
+                last_planned_window_start_epoch=last_planned_window_start_epoch,
+            )
+            _log_queued_window_capture(plan, windows)
+            future = executor.submit(
+                _run_single_window_capture,
                 config_path=config_path,
                 interval_seconds=interval_seconds,
                 event_duration_seconds=event_duration_seconds,
-                window_start=current_window_start,
+                window_start=plan["window_start"],
+                run_timestamp=plan["run_timestamp"],
                 event_slug_prefixes=event_slug_prefixes,
                 series_slugs=series_slugs,
             )
-        )
+            future_to_index[future] = next_window_index
+            last_planned_window_start_epoch = int(plan["window_start"])
+            next_window_index += 1
 
-    return results
+        while future_to_index:
+            completed, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
+            for future in completed:
+                finished_index = future_to_index.pop(future)
+                results_by_index[finished_index] = future.result()
+
+                if next_window_index < windows:
+                    plan = _resolve_window_capture_plan(
+                        event_slug_prefixes=event_slug_prefixes,
+                        event_duration_seconds=event_duration_seconds,
+                        window_start=window_start,
+                        window_index=next_window_index,
+                        last_planned_window_start_epoch=last_planned_window_start_epoch,
+                    )
+                    _log_queued_window_capture(plan, windows)
+                    queued_future = executor.submit(
+                        _run_single_window_capture,
+                        config_path=config_path,
+                        interval_seconds=interval_seconds,
+                        event_duration_seconds=event_duration_seconds,
+                        window_start=plan["window_start"],
+                        run_timestamp=plan["run_timestamp"],
+                        event_slug_prefixes=event_slug_prefixes,
+                        series_slugs=series_slugs,
+                    )
+                    future_to_index[queued_future] = next_window_index
+                    last_planned_window_start_epoch = int(plan["window_start"])
+                    next_window_index += 1
+
+    return [results_by_index[index] for index in range(windows)]
 
 
 def _run_single_window_capture(
@@ -77,6 +164,7 @@ def _run_single_window_capture(
     interval_seconds: float,
     event_duration_seconds: int,
     window_start: str,
+    run_timestamp: str,
     event_slug_prefixes: list[str],
     series_slugs: list[str],
 ) -> dict[str, Any]:
@@ -90,6 +178,7 @@ def _run_single_window_capture(
                 duration_seconds=float(event_duration_seconds),
                 event_duration_seconds=event_duration_seconds,
                 window_start=window_start,
+                run_timestamp=run_timestamp,
                 event_limit=len(event_slug_prefixes),
                 event_slug_prefixes=event_slug_prefixes,
                 series_slugs=series_slugs,
@@ -102,6 +191,7 @@ def _run_single_window_capture(
                 duration_seconds=float(event_duration_seconds),
                 event_duration_seconds=event_duration_seconds,
                 window_start=window_start,
+                run_timestamp=run_timestamp,
             ): "spot",
         }
 
@@ -111,7 +201,7 @@ def _run_single_window_capture(
             results[collector_name] = future.result()
             logger.info("%s collector completed: %s", collector_name, results[collector_name])
 
-    return results
+    return {"run_timestamp": run_timestamp, **results}
 
 
 def main() -> None:

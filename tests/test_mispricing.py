@@ -1,10 +1,35 @@
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
+import pytest
+
 from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
 
 
-def _summary_row(outcome_name: str, best_bid: float, best_ask: float) -> dict:
+def _state_row(
+    outcome_name: str,
+    best_bid: float,
+    best_ask: float,
+    *,
+    market_implied_up_probability: float = 0.50,
+    fundamental_up_probability: float = 0.50,
+    latent_up_probability: float = 0.50,
+    orderbook_imbalance: float = 0.0,
+    weighted_imbalance: float | None = None,
+    bid_depth_top_5: float = 100.0,
+    ask_depth_top_5: float = 100.0,
+    book_velocity: float = 0.0,
+    spot_vol_multiplier: float = 1.0,
+    cross_book_basis: float = 0.0,
+    dist_to_boundary: float | None = None,
+) -> dict:
     now = datetime.now(timezone.utc)
+    mid_price = (best_bid + best_ask) / 2
+    if weighted_imbalance is None:
+        weighted_imbalance = orderbook_imbalance
+    if dist_to_boundary is None:
+        dist_to_boundary = min(latent_up_probability, 1.0 - latent_up_probability)
+
     return {
         "series_slug": "btc-up-or-down-5m",
         "asset": "BTC",
@@ -24,93 +49,198 @@ def _summary_row(outcome_name: str, best_bid: float, best_ask: float) -> dict:
         "best_bid": best_bid,
         "best_ask": best_ask,
         "spread": best_ask - best_bid,
-        "mid_price": (best_bid + best_ask) / 2,
+        "mid_price": mid_price,
         "bid_depth": 100.0,
         "ask_depth": 100.0,
-        "bid_depth_top_5": 100.0,
-        "ask_depth_top_5": 100.0,
-        "orderbook_imbalance": 0.0,
+        "bid_depth_top_5": bid_depth_top_5,
+        "ask_depth_top_5": ask_depth_top_5,
+        "orderbook_imbalance": orderbook_imbalance,
+        "weighted_imbalance": weighted_imbalance,
+        "book_velocity": book_velocity,
         "bid_levels": 1,
         "ask_levels": 1,
         "book_hash": "hash",
+        "spot_price": 101.0,
+        "reference_spot_price": 100.0,
+        "reference_source": "coinbase_1m_candle_open",
+        "seconds_to_end": 240.0,
+        "market_implied_up_probability": market_implied_up_probability,
+        "fundamental_up_probability": fundamental_up_probability,
+        "latent_up_probability": latent_up_probability,
+        "spot_vol_multiplier": spot_vol_multiplier,
+        "cross_book_basis": cross_book_basis,
+        "dist_to_boundary": dist_to_boundary,
     }
 
 
-def test_mispricing_detector_flags_underpriced_up_token() -> None:
+def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> None:
     detector = RealTimeMispricingDetector(
         MispricingDetectorConfig(
-            min_edge=0.05,
-            fallback_volatility_per_sqrt_second=0.0005,
-            n_samples=2_000,
-            use_particle_filter=False,
+            n_samples=512,
+            logit_diffusion_vol=0.0,
+            logit_jump_intensity=0.0,
+            edge_threshold=0.01,
+            max_allowed_risk=0.05,
             seed=42,
         )
     )
 
-    spot_ticks = {
-        "BTC": {
-            "asset": "BTC",
-            "product_id": "BTC-USD",
-            "source": "coinbase",
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-            "exchange_time": datetime.now(timezone.utc).isoformat(),
-            "price": 101.0,
-            "bid": 100.9,
-            "ask": 101.1,
-        }
-    }
-    rows = [
-        _summary_row("Up", best_bid=0.50, best_ask=0.60),
-        _summary_row("Down", best_bid=0.39, best_ask=0.40),
+    state_rows = [
+        _state_row(
+            "Up",
+            best_bid=0.50,
+            best_ask=0.60,
+            market_implied_up_probability=0.55,
+            fundamental_up_probability=0.74,
+            latent_up_probability=0.72,
+            orderbook_imbalance=0.10,
+            weighted_imbalance=0.10,
+        ),
+        _state_row(
+            "Down",
+            best_bid=0.39,
+            best_ask=0.40,
+            market_implied_up_probability=0.55,
+            fundamental_up_probability=0.74,
+            latent_up_probability=0.72,
+            orderbook_imbalance=-0.10,
+            weighted_imbalance=-0.10,
+        ),
     ]
-    reference_prices = {
-        "btc-updown-5m-test": {
-            "price": 100.0,
-            "source": "coinbase_1m_candle_open",
-        }
-    }
 
-    signals = detector.detect(rows, spot_ticks, reference_prices_by_event=reference_prices)
+    valuations = detector.detect(state_rows)
 
-    assert len(signals) == 2
-    up_signal = next(row for row in signals if row["outcome_name"] == "Up")
-    down_signal = next(row for row in signals if row["outcome_name"] == "Down")
-    assert up_signal["signal"] == "BUY"
-    assert up_signal["buy_edge"] > 0.05
-    assert up_signal["reference_source"] == "coinbase_1m_candle_open"
-    assert 0.0 <= up_signal["fair_up_probability"] <= 1.0
-    assert down_signal["signal"] in {"HOLD", "SELL"}
-    assert down_signal["fair_token_price"] == 1.0 - up_signal["fair_up_probability"]
+    assert len(valuations) == 2
+    up_valuation = next(row for row in valuations if row["outcome_name"] == "Up")
+    down_valuation = next(row for row in valuations if row["outcome_name"] == "Down")
+    assert up_valuation["pricing_method"] == "markov_mcmc"
+    assert up_valuation["buy_edge"] > 0.10
+    assert up_valuation["buy_signal"] is True
+    assert up_valuation["risk_score"] == pytest.approx(0.0)
+    assert 0.0 <= up_valuation["fair_up_probability"] <= 1.0
+    assert down_valuation["fair_token_price"] == pytest.approx(1.0 - up_valuation["fair_up_probability"])
+    assert "signal" not in up_valuation
+    assert "net_buy_edge" not in up_valuation
+    assert "inventory_penalty" not in up_valuation
 
 
-def test_mispricing_detector_holds_when_toxicity_is_too_high() -> None:
+def test_mispricing_detector_applies_risk_gate_to_buy_signal(monkeypatch: pytest.MonkeyPatch) -> None:
     detector = RealTimeMispricingDetector(
         MispricingDetectorConfig(
-            min_edge=0.01,
-            max_toxicity=0.0,
-            n_samples=1_000,
-            use_particle_filter=False,
+            edge_threshold=0.01,
+            max_allowed_risk=0.05,
             seed=42,
         )
     )
-    detector.reference_spot_prices["btc-updown-5m-test"] = 100.0
 
-    now = datetime.now(timezone.utc)
-    spot_ticks = {
-        "BTC": {
-            "asset": "BTC",
-            "product_id": "BTC-USD",
-            "source": "coinbase",
-            "collected_at": now.isoformat(),
-            "price": 101.0,
+    class _FakeDistribution:
+        def __init__(self, expected_fair_price: float, risk_score: float) -> None:
+            self.expected_fair_price = expected_fair_price
+            self.risk_score = risk_score
+            self.n_paths = 1000
+            self.diagnostics = {}
+
+    class _FakeSimulation:
+        expected_terminal_probability = 0.62
+        terminal_probability_std = 0.20
+        n_paths = 1000
+        diagnostics = {
+            "n_steps": 10,
+            "dt_seconds": 1.0,
+            "conditioned_drift": 0.0,
+            "conditioned_diffusion": 0.2,
+            "conditioned_jump_intensity": 0.05,
         }
-    }
-    rows = [_summary_row("Up", best_bid=0.50, best_ask=0.60)]
 
-    detector.detect(rows, spot_ticks)
-    spot_ticks["BTC"]["collected_at"] = (now + timedelta(seconds=2)).isoformat()
-    spot_ticks["BTC"]["price"] = 103.0
-    signals = detector.detect(rows, spot_ticks)
+        def aggregate(self, pricing_model=None, invert_probability: bool = False):
+            if invert_probability:
+                return _FakeDistribution(0.38, 0.20)
+            return _FakeDistribution(0.62, 0.20)
 
-    assert signals[0]["toxicity_score"] > 0.0
-    assert signals[0]["signal"] == "HOLD"
+    monkeypatch.setattr(detector.engine, "simulate", lambda **_: _FakeSimulation())
+
+    valuations = detector.detect(
+        [
+            _state_row("Up", best_bid=0.50, best_ask=0.55, latent_up_probability=0.60),
+            _state_row("Down", best_bid=0.44, best_ask=0.45, latent_up_probability=0.60),
+        ]
+    )
+
+    up_valuation = next(row for row in valuations if row["outcome_name"] == "Up")
+    assert up_valuation["buy_edge"] > 0.01
+    assert up_valuation["risk_score"] == pytest.approx(0.20)
+    assert up_valuation["buy_signal"] is False
+
+
+def test_mispricing_detector_does_not_emit_toxicity_from_valuation_layer() -> None:
+    detector = RealTimeMispricingDetector(
+        MispricingDetectorConfig(
+            n_samples=256,
+            logit_diffusion_vol=0.0,
+            logit_jump_intensity=0.0,
+            seed=42,
+        )
+    )
+    valuations = detector.detect(
+        [
+            _state_row(
+                "Up",
+                best_bid=0.50,
+                best_ask=0.60,
+                market_implied_up_probability=0.55,
+                fundamental_up_probability=0.60,
+                latent_up_probability=0.58,
+            )
+        ]
+    )
+
+    assert "toxicity_score" not in valuations[0]
+    assert "signal" not in valuations[0]
+
+
+def test_only_markov_mcmc_pricing_method_is_supported() -> None:
+    with pytest.raises(ValueError, match="pricing_method must be 'markov_mcmc'"):
+        RealTimeMispricingDetector(
+            MispricingDetectorConfig(
+                pricing_method="latent",
+            )
+        )
+
+
+def test_mispricing_detector_skips_nan_latent_probability() -> None:
+    detector = RealTimeMispricingDetector(MispricingDetectorConfig(seed=42))
+
+    valuations = detector.detect(
+        [
+            _state_row("Up", best_bid=0.50, best_ask=0.55, latent_up_probability=np.nan),
+            _state_row("Down", best_bid=0.44, best_ask=0.45, latent_up_probability=np.nan),
+        ]
+    )
+
+    assert valuations == []
+
+
+def test_simulation_market_state_handles_missing_side_signals_without_warning() -> None:
+    detector = RealTimeMispricingDetector(MispricingDetectorConfig(seed=42))
+
+    state = detector._simulation_market_state(
+        [
+            _state_row(
+                "Up",
+                best_bid=0.50,
+                best_ask=0.55,
+                latent_up_probability=0.60,
+                weighted_imbalance=np.nan,
+                bid_depth_top_5=np.nan,
+                ask_depth_top_5=np.nan,
+                book_velocity=np.nan,
+                cross_book_basis=np.nan,
+                dist_to_boundary=np.nan,
+            )
+        ]
+    )
+
+    assert state.imbalance_signal == 0.0
+    assert state.liquidity_depth == 0.0
+    assert state.book_velocity == 0.0
+    assert 0.0 <= state.boundary_distance <= 0.5

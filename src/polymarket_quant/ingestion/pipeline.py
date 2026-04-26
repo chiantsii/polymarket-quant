@@ -5,7 +5,6 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from polymarket_quant.ingestion.client import BasePolymarketClient
-from polymarket_quant.schemas.market import MarketMetadata
 from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -20,154 +19,6 @@ class IngestionPipeline:
         
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
-
-    def run_market_metadata_ingestion(self):
-        """Fetches active markets, saves raw payload, and processes to canonical schemas."""
-        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        logger.info("Starting market metadata ingestion run.")
-
-        # 1. Fetch Raw Data
-        raw_markets = self.client.fetch_active_markets()
-        if not raw_markets:
-            logger.warning("No markets fetched. Aborting pipeline.")
-            return
-
-        # 2. Save Raw Data (Immutable record of API responses)
-        raw_path = self.raw_dir / f"markets_raw_{run_timestamp}.json"
-        self._write_json(raw_path, raw_markets)
-        self._write_json(self.raw_dir / "markets_raw_latest.json", raw_markets)
-        logger.info(f"Saved {len(raw_markets)} raw records to {raw_path}")
-
-        # 3. Normalize to Canonical Schemas
-        normalized_markets = []
-        for raw_mkt in raw_markets:
-            try:
-                # Mapping adapter logic: translating raw API keys to our schema
-                # TODO: Adjust these mappings based on exact live API payload structures
-                market = MarketMetadata(
-                    id=raw_mkt.get("id", raw_mkt.get("condition_id", "unknown")),
-                    condition_id=raw_mkt.get("condition_id", raw_mkt.get("conditionId", "")),
-                    title=raw_mkt.get("question", raw_mkt.get("title", "")),
-                    category=raw_mkt.get("category", "Unknown"),
-                    resolution_date=raw_mkt.get("endDate", datetime.now(timezone.utc).isoformat()),
-                    is_active=raw_mkt.get("active", True),
-                    contracts=self._extract_contracts(raw_mkt),
-                )
-                normalized_markets.append(market)
-            except Exception as e:
-                logger.debug(f"Skipping malformed market {raw_mkt.get('id', 'unknown')}: {e}")
-
-        # 4. Save Processed Data (Parquet for analytics/research readiness)
-        if normalized_markets:
-            df = pd.DataFrame([m.model_dump() for m in normalized_markets])
-            # Save derived features dynamically 
-            df['time_to_resolution_seconds'] = [m.time_to_resolution_seconds for m in normalized_markets]
-            
-            processed_path = self.processed_dir / f"markets_normalized_{run_timestamp}.parquet"
-            df.to_parquet(processed_path, index=False)
-            df.to_parquet(self.processed_dir / "markets_normalized_latest.parquet", index=False)
-            logger.info(f"Successfully processed and saved {len(df)} markets to {processed_path}")
-
-    def run_orderbook_snapshot_ingestion(self, market_limit: int = 20):
-        """Fetch current orderbook snapshots for active market outcome tokens."""
-        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        logger.info("Starting orderbook snapshot ingestion run.")
-
-        raw_markets = self.client.fetch_active_markets(limit=market_limit)
-        token_rows = self._extract_token_rows(raw_markets)
-        if not token_rows:
-            logger.warning("No CLOB token ids found. Aborting orderbook pipeline.")
-            return
-
-        raw_snapshots = []
-        processed_rows = []
-        for token_row in token_rows:
-            book = self.client.fetch_orderbook(token_row["token_id"])
-            if not book:
-                continue
-
-            raw_snapshots.append({**token_row, "orderbook": book})
-            processed_rows.append(self._summarize_orderbook(token_row, book))
-
-        if not raw_snapshots:
-            logger.warning("No orderbooks fetched. Aborting orderbook pipeline.")
-            return
-
-        raw_path = self.raw_dir / f"orderbooks_raw_{run_timestamp}.json"
-        self._write_json(raw_path, raw_snapshots)
-        self._write_json(self.raw_dir / "orderbooks_raw_latest.json", raw_snapshots)
-        logger.info(f"Saved {len(raw_snapshots)} raw orderbook records to {raw_path}")
-
-        df = pd.DataFrame(processed_rows)
-        processed_path = self.processed_dir / f"orderbooks_snapshot_{run_timestamp}.parquet"
-        df.to_parquet(processed_path, index=False)
-        df.to_parquet(self.processed_dir / "orderbooks_snapshot_latest.parquet", index=False)
-        logger.info(f"Saved {len(df)} processed orderbook summaries to {processed_path}")
-
-    def run_crypto_5m_history_ingestion(
-        self,
-        series_slugs: List[str],
-        event_limit: int = 10,
-        interval: str = "max",
-        fidelity: int = 1,
-        closed_only: bool = True,
-    ) -> None:
-        """Fetch historical CLOB prices for BTC/ETH Up or Down 5m markets."""
-        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        logger.info("Starting crypto 5m historical price ingestion run.")
-
-        raw_records = []
-        processed_rows = []
-        for series_slug in series_slugs:
-            for event in self._get_series_events(series_slug, event_limit, closed_only=closed_only):
-                event_detail = self.client.fetch_event_by_slug(event["slug"])
-                if not event_detail:
-                    continue
-
-                for market in event_detail.get("markets", []):
-                    for token in self._extract_contracts(market):
-                        token_id = token["token_id"]
-                        if not token_id:
-                            continue
-
-                        price_history = self.client.fetch_price_history(
-                            token_id=token_id,
-                            interval=interval,
-                            fidelity=fidelity,
-                        )
-                        raw_records.append(
-                            {
-                                "series_slug": series_slug,
-                                "event": event_detail,
-                                "market": market,
-                                "token": token,
-                                "price_history": price_history,
-                            }
-                        )
-                        processed_rows.extend(
-                            self._price_history_rows(
-                                series_slug=series_slug,
-                                event=event_detail,
-                                market=market,
-                                token=token,
-                                price_history=price_history,
-                            )
-                        )
-
-        if not raw_records:
-            logger.warning("No historical price records fetched. Aborting crypto 5m history pipeline.")
-            return
-
-        raw_path = self.raw_dir / f"crypto_5m_history_raw_{run_timestamp}.json"
-        self._write_json(raw_path, raw_records)
-        self._write_json(self.raw_dir / "crypto_5m_history_raw_latest.json", raw_records)
-        logger.info(f"Saved {len(raw_records)} raw crypto 5m history records to {raw_path}")
-
-        df = pd.DataFrame(processed_rows)
-        processed_path = self.processed_dir / f"crypto_5m_price_history_{run_timestamp}.parquet"
-        df.to_parquet(processed_path, index=False)
-        df.to_parquet(self.processed_dir / "crypto_5m_price_history_latest.parquet", index=False)
-        logger.info(f"Saved {len(df)} crypto 5m historical price rows to {processed_path}")
 
     def collect_crypto_5m_orderbooks_once(
         self,
@@ -279,69 +130,6 @@ class IngestionPipeline:
         logger.info(f"Saved {len(levels_df)} orderbook level rows to {levels_path}")
         logger.info(f"Saved {len(summary_df)} orderbook summary rows to {summary_path}")
 
-    def collect_crypto_5m_resolutions_for_event_slugs(
-        self,
-        event_slugs: List[str],
-        event_slug_prefixes: Optional[List[str]] = None,
-        resolved_only: bool = True,
-    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Collect winner labels for explicitly requested BTC/ETH 5m event slugs."""
-        resolved_at = datetime.now(timezone.utc).isoformat()
-        raw_records = []
-        resolution_rows = []
-        seen_event_slugs = set()
-
-        for event_slug in event_slugs:
-            if not event_slug or event_slug in seen_event_slugs:
-                continue
-            if event_slug_prefixes and not self._matches_event_slug_prefix(event_slug, event_slug_prefixes):
-                continue
-            seen_event_slugs.add(event_slug)
-
-            event_detail = self.client.fetch_event_by_slug(event_slug)
-            if not event_detail:
-                continue
-
-            series_slug = self._series_slug_from_event_slug(event_slug)
-            raw_records.append({"series_slug": series_slug, "event": event_detail, "resolved_at": resolved_at})
-            for market in event_detail.get("markets", []):
-                market_rows = self._crypto_5m_resolution_rows(
-                    series_slug=series_slug,
-                    event=event_detail,
-                    market=market,
-                    resolved_at=resolved_at,
-                )
-                if resolved_only:
-                    market_rows = [row for row in market_rows if row["is_winner"] is not None]
-                resolution_rows.extend(market_rows)
-
-        return raw_records, resolution_rows
-
-    def save_crypto_5m_resolutions(
-        self,
-        raw_records: List[Dict[str, Any]],
-        resolution_rows: List[Dict[str, Any]],
-        run_timestamp: Optional[str] = None,
-    ) -> None:
-        """Persist recently collected resolution labels."""
-        if not raw_records:
-            logger.warning("No crypto 5m resolution records to save.")
-            return
-        if not resolution_rows:
-            logger.warning("No crypto 5m resolution labels to save.")
-            return
-
-        run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        raw_path = self.raw_dir / f"crypto_5m_resolutions_raw_{run_timestamp}.json"
-        self._write_json(raw_path, raw_records)
-        self._write_json(self.raw_dir / "crypto_5m_resolutions_raw_latest.json", raw_records)
-
-        df = pd.DataFrame(resolution_rows)
-        processed_path = self.processed_dir / f"crypto_5m_resolutions_{run_timestamp}.parquet"
-        df.to_parquet(processed_path, index=False)
-        df.to_parquet(self.processed_dir / "crypto_5m_resolutions_latest.parquet", index=False)
-        logger.info(f"Saved {len(df)} crypto 5m resolution rows to {processed_path}")
-
     def _write_json(self, path: Path, payload: Any) -> None:
         with open(path, "w") as f:
             json.dump(payload, f)
@@ -363,24 +151,6 @@ class IngestionPipeline:
             {"token_id": str(token_id), "outcome_name": str(outcome)}
             for token_id, outcome in zip(token_ids, outcomes)
         ]
-
-    def _extract_token_rows(self, raw_markets: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        rows = []
-        for raw_market in raw_markets:
-            for contract in self._extract_contracts(raw_market):
-                token_id = contract["token_id"]
-                if not token_id:
-                    continue
-                rows.append(
-                    {
-                        "market_id": str(raw_market.get("id", "")),
-                        "condition_id": str(raw_market.get("condition_id", raw_market.get("conditionId", ""))),
-                        "title": str(raw_market.get("question", raw_market.get("title", ""))),
-                        "outcome_name": contract["outcome_name"],
-                        "token_id": token_id,
-                    }
-                )
-        return rows
 
     def _loads_json_list(self, value: Any) -> List[Any]:
         if isinstance(value, list):
@@ -464,45 +234,6 @@ class IngestionPipeline:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    def _price_history_rows(
-        self,
-        series_slug: str,
-        event: Dict[str, Any],
-        market: Dict[str, Any],
-        token: Dict[str, str],
-        price_history: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        outcome_prices = self._loads_json_list(market.get("outcomePrices"))
-        outcomes = self._loads_json_list(market.get("outcomes"))
-        outcome_name = token["outcome_name"]
-        outcome_price = self._lookup_outcome_price(outcomes, outcome_prices, outcome_name)
-        is_winner = self._infer_winner(outcome_price)
-
-        rows = []
-        for point in price_history.get("history", []):
-            timestamp = datetime.fromtimestamp(int(point["t"]), tz=timezone.utc).isoformat()
-            rows.append(
-                {
-                    "series_slug": series_slug,
-                    "asset": "BTC" if series_slug.startswith("btc") else "ETH",
-                    "event_id": event.get("id"),
-                    "event_slug": event.get("slug"),
-                    "event_title": event.get("title"),
-                    "market_id": market.get("id"),
-                    "condition_id": market.get("conditionId", market.get("condition_id")),
-                    "token_id": token["token_id"],
-                    "outcome_name": outcome_name,
-                    "timestamp": timestamp,
-                    "price": float(point["p"]),
-                    "market_start_time": market.get("eventStartTime", event.get("startTime")),
-                    "market_end_time": market.get("endDate", event.get("endDate")),
-                    "closed": market.get("closed", event.get("closed")),
-                    "outcome_price": outcome_price,
-                    "is_winner": is_winner,
-                }
-            )
-        return rows
-
     def _crypto_5m_token_row(
         self,
         series_slug: str,
@@ -525,44 +256,6 @@ class IngestionPipeline:
             "closed": market.get("closed", event.get("closed")),
             "accepting_orders": market.get("acceptingOrders"),
         }
-
-    def _crypto_5m_resolution_rows(
-        self,
-        series_slug: str,
-        event: Dict[str, Any],
-        market: Dict[str, Any],
-        resolved_at: str,
-    ) -> List[Dict[str, Any]]:
-        outcome_prices = self._loads_json_list(market.get("outcomePrices"))
-        outcomes = self._loads_json_list(market.get("outcomes"))
-        rows = []
-        for token in self._extract_contracts(market):
-            token_id = token["token_id"]
-            if not token_id:
-                continue
-
-            outcome_name = token["outcome_name"]
-            outcome_price = self._lookup_outcome_price(outcomes, outcome_prices, outcome_name)
-            rows.append(
-                {
-                    "series_slug": series_slug,
-                    "asset": "BTC" if series_slug.startswith("btc") else "ETH",
-                    "event_id": event.get("id"),
-                    "event_slug": event.get("slug"),
-                    "event_title": event.get("title"),
-                    "market_id": market.get("id"),
-                    "condition_id": market.get("conditionId", market.get("condition_id")),
-                    "token_id": token_id,
-                    "outcome_name": outcome_name,
-                    "market_start_time": market.get("eventStartTime", event.get("startTime")),
-                    "market_end_time": market.get("endDate", event.get("endDate")),
-                    "closed": market.get("closed", event.get("closed")),
-                    "outcome_price": outcome_price,
-                    "is_winner": self._infer_winner(outcome_price),
-                    "resolved_at": resolved_at,
-                }
-            )
-        return rows
 
     def _orderbook_level_rows(
         self,
@@ -589,26 +282,6 @@ class IngestionPipeline:
                     }
                 )
         return rows
-
-    def _lookup_outcome_price(
-        self,
-        outcomes: List[Any],
-        outcome_prices: List[Any],
-        outcome_name: str,
-    ) -> Optional[float]:
-        for raw_outcome, raw_price in zip(outcomes, outcome_prices):
-            if str(raw_outcome) == outcome_name:
-                return float(raw_price)
-        return None
-
-    def _infer_winner(self, outcome_price: Optional[float]) -> Optional[int]:
-        if outcome_price is None:
-            return None
-        if outcome_price >= 0.999:
-            return 1
-        if outcome_price <= 0.001:
-            return 0
-        return None
 
     def _summarize_orderbook(self, token_row: Dict[str, str], book: Dict[str, Any]) -> Dict[str, Any]:
         bids = book.get("bids", [])
@@ -653,9 +326,9 @@ class IngestionPipeline:
             return None
         return (bid_depth - ask_depth) / total_depth
 
-    def _parse_clob_timestamp(self, timestamp: Any) -> str:
+    def _parse_clob_timestamp(self, timestamp: Any) -> str | None:
         if timestamp is None:
-            return datetime.now(timezone.utc).isoformat()
+            return None
         ts = int(timestamp)
         if ts > 10_000_000_000:
             ts = ts / 1000

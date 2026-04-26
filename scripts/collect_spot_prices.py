@@ -24,6 +24,7 @@ def collect_spot_prices(
     duration_seconds: float = 300.0,
     event_duration_seconds: int = 300,
     window_start: str | None = None,
+    run_timestamp: str | None = None,
 ) -> dict[str, int | str]:
     """Collect Coinbase BTC/ETH spot tickers and persist raw/processed datasets."""
     with open(config_path, "r") as f:
@@ -42,13 +43,14 @@ def collect_spot_prices(
         )
         wait_until(full_window.start, interval_seconds, logger)
         duration_seconds = max(0.0, (full_window.end - datetime.now(timezone.utc)).total_seconds())
+        run_timestamp = run_timestamp or full_window.start.strftime("%Y%m%d_%H%M%S")
         logger.info(
             "Collecting spot prices for full event window %s -> %s",
             full_window.start.isoformat(),
             full_window.end.isoformat(),
         )
 
-    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     deadline = time.monotonic() + duration_seconds
     spot_rows: List[Dict[str, Any]] = []
     poll_count = 0
@@ -118,6 +120,7 @@ def main() -> None:
         duration_seconds=args.duration_seconds,
         event_duration_seconds=args.event_duration_seconds,
         window_start=args.window_start,
+        run_timestamp=None,
     )
 
 
