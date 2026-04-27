@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -14,15 +13,11 @@ from polymarket_quant.utils.logger import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_EVENT_STATE_GLOB = "data/processed/crypto_5m_event_state_latest.parquet"
-DEFAULT_TRANSITION_MODEL_PATH = "artifacts/transition_model/transition_model_latest.joblib"
-
-
 def _build_detector_config(
     *,
     pricing_method: str,
     n_samples: int,
-    fallback_volatility_per_sqrt_second: float,
-    event_duration_seconds: float,
+    fallback_spot_volatility_per_sqrt_second: float,
     edge_threshold: float,
     max_allowed_risk: float,
     simulation_dt_seconds: float,
@@ -32,8 +27,7 @@ def _build_detector_config(
     return MispricingDetectorConfig(
         pricing_method=pricing_method,
         n_samples=n_samples,
-        fallback_volatility_per_sqrt_second=fallback_volatility_per_sqrt_second,
-        event_duration_seconds=event_duration_seconds,
+        fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
         max_allowed_risk=max_allowed_risk,
         simulation_dt_seconds=simulation_dt_seconds,
@@ -46,14 +40,11 @@ def replay_pricing(
     output_dir: str = "data/processed",
     pricing_method: str = "markov_mcmc",
     n_samples: int = 1_000,
-    event_duration_seconds: float = 300.0,
-    fallback_volatility_per_sqrt_second: float = 0.0005,
+    fallback_spot_volatility_per_sqrt_second: float = 0.0005,
     edge_threshold: float = 0.0,
     max_allowed_risk: float = 0.10,
     simulation_dt_seconds: float = 1.0,
     rollout_horizon_seconds: float = 0.0,
-    transition_model_path: str = DEFAULT_TRANSITION_MODEL_PATH,
-    transition_bundle: Any | None = None,
     max_rows: int | None = None,
     show_progress: bool = False,
     include_latest: bool = False,
@@ -70,8 +61,7 @@ def replay_pricing(
     detector_config = _build_detector_config(
         pricing_method=pricing_method,
         n_samples=n_samples,
-        fallback_volatility_per_sqrt_second=fallback_volatility_per_sqrt_second,
-        event_duration_seconds=event_duration_seconds,
+        fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
         max_allowed_risk=max_allowed_risk,
         simulation_dt_seconds=simulation_dt_seconds,
@@ -80,30 +70,17 @@ def replay_pricing(
     if max_rows is not None:
         event_state = event_state.head(max(int(max_rows), 0)).copy()
 
-    # The pricing detector needs the trained next-state kernel for repeated
-    # Markov rollout. If the artifact is missing, the detector falls back to
-    # its simpler single-kernel simulation path.
-    if transition_bundle is None and pricing_method == "markov_mcmc":
-        model_path = Path(transition_model_path)
-        if model_path.exists():
-            transition_bundle = joblib.load(model_path)
-        else:
-            logger.warning(
-                "Transition model artifact %s was not found; replay_pricing will fall back to single-kernel simulation",
-                model_path,
-            )
-
     # Log the implied workload before we start. This is especially useful for
     # rollout-based pricing, where runtime scales with rows x steps x paths.
     _log_replay_workload_estimate(
         event_state=event_state,
         n_samples=n_samples,
         pricing_method=pricing_method,
-        transition_bundle=transition_bundle,
         rollout_horizon_seconds=rollout_horizon_seconds,
+        simulation_dt_seconds=simulation_dt_seconds,
     )
 
-    detector = RealTimeMispricingDetector(detector_config, transition_bundle=transition_bundle)
+    detector = RealTimeMispricingDetector(detector_config)
 
     replay_rows = detector.detect(
         state_rows=event_state.to_dict("records"),
@@ -140,8 +117,8 @@ def _log_replay_workload_estimate(
     event_state: pd.DataFrame,
     n_samples: int,
     pricing_method: str,
-    transition_bundle: Any | None,
     rollout_horizon_seconds: float,
+    simulation_dt_seconds: float,
 ) -> None:
     """Emit a lightweight runtime estimate before pricing replay starts."""
     if event_state.empty:
@@ -159,10 +136,8 @@ def _log_replay_workload_estimate(
 
     if rollout_horizon_seconds > 0.0:
         step_seconds = float(rollout_horizon_seconds)
-    elif transition_bundle is not None:
-        step_seconds = float(getattr(transition_bundle, "default_step_seconds", 0.0) or 0.0)
     else:
-        step_seconds = 0.0
+        step_seconds = float(simulation_dt_seconds)
 
     if step_seconds <= 0.0:
         logger.info(
@@ -208,12 +183,7 @@ def main() -> None:
         "--rollout-horizon-seconds",
         type=float,
         default=0.0,
-        help="Optional rollout step in seconds. Use 0 to follow the trained transition model's default next-step cadence",
-    )
-    parser.add_argument(
-        "--transition-model-path",
-        default=DEFAULT_TRANSITION_MODEL_PATH,
-        help="Path to the trained transition-model artifact used for repeated next-state rollout",
+        help="Optional simulation step override in seconds. Use 0 to follow --simulation-dt-seconds.",
     )
     parser.add_argument(
         "--max-rows",
@@ -224,12 +194,11 @@ def main() -> None:
     parser.add_argument("--no-progress", action="store_true", help="Disable progress output during pricing replay")
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Minimum edge required to signal a buy")
     parser.add_argument("--max-allowed-risk", type=float, default=0.10, help="Maximum risk score allowed for a buy signal")
-    parser.add_argument("--event-duration-seconds", type=float, default=300.0, help="Event duration in seconds")
     parser.add_argument(
-        "--fallback-volatility-per-sqrt-second",
+        "--fallback-spot-volatility-per-sqrt-second",
         type=float,
         default=0.0005,
-        help="Volatility used before enough spot history exists",
+        help="Fallback spot volatility used when event_state is missing volatility_per_sqrt_second",
     )
     parser.add_argument("--include-latest", action="store_true", help="Include *_latest.parquet inputs")
     args = parser.parse_args()
@@ -243,11 +212,9 @@ def main() -> None:
         max_allowed_risk=args.max_allowed_risk,
         simulation_dt_seconds=args.simulation_dt_seconds,
         rollout_horizon_seconds=args.rollout_horizon_seconds,
-        transition_model_path=args.transition_model_path,
         max_rows=args.max_rows,
         show_progress=not args.no_progress,
-        event_duration_seconds=args.event_duration_seconds,
-        fallback_volatility_per_sqrt_second=args.fallback_volatility_per_sqrt_second,
+        fallback_spot_volatility_per_sqrt_second=args.fallback_spot_volatility_per_sqrt_second,
         include_latest=args.include_latest,
     )
     logger.info("Replay complete: %s", result)

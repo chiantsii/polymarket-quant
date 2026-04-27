@@ -9,7 +9,7 @@ data capture
 -> market_state
 -> event_state
 -> latent probability / regime Markov modeling
--> fair-price model
+-> binary payoff fair-price model
 -> edge extraction
 ```
 
@@ -28,6 +28,33 @@ This means:
 - the latent state may evolve under jump and regime-switching dynamics
 - pricing should be based on current or predicted latent state
 - edge should come from model fair value versus executable Polymarket prices
+
+## Current Pricing Object
+
+The active pricing layer values the Polymarket binary contract directly.
+
+For an `Up` market with reference opening price `K = reference_spot_price`, the
+current fair value is defined as:
+
+```text
+fair_up_probability(t) = P(spot_T >= K | current information at t)
+```
+
+The replay engine estimates this quantity by simulating terminal spot paths and
+applying the binary payoff path by path:
+
+```text
+payoff_i = 1{spot_T_i >= reference_spot_price}
+fair_up_probability = mean(payoff_i)
+fair_token_price(Up) = fair_up_probability
+fair_token_price(Down) = 1 - fair_up_probability
+```
+
+Edges are then defined against executable Polymarket prices:
+
+- `buy_edge = fair_token_price - best_ask`
+- `hold_edge = fair_token_price - best_bid`
+- `sell_edge = best_bid - fair_token_price`
 
 ## State Design
 
@@ -55,7 +82,7 @@ Where:
 
 `event_state` should be treated as the serialized row-level representation of the current `S_t`.
 
-## First Transition Objective
+## Transition Research Objective
 
 The first transition model should not try to predict repair outcomes or final winners.
 
@@ -79,7 +106,8 @@ In practice this means the first model should learn:
 - how uncertain the next state is
 - when the transition kernel becomes jump-like instead of smooth
 
-These transition quantities are not part of `L_t`; they belong to the learned kernel used by `fit_transition_model.py` and `MarkovSimulationEngine`.
+These transition quantities are not part of `L_t`; they belong to the learned
+kernel used by `fit_transition_model.py`.
 
 ## Current Architecture
 
@@ -98,20 +126,30 @@ build_event_state.py
     ↓
 event_state = S_t
     ↓
+mispricing.py + MarkovSimulationEngine
+    ↓
+simulate terminal spot paths
+    ↓
+apply binary payoff 1{spot_T >= reference_spot_price}
+    ↓
+fair_up_probability
+fair_token_price
+    ↓
+buy_edge / hold_edge / sell_edge
+```
+
+There is also a parallel transition-modeling track:
+
+```text
+event_state = S_t
+    ↓
 build_transition_targets.py
     ↓
 structured transition targets for P(S_{n+1} | S_n)
     ↓
 fit_transition_model.py
     ↓
-drift / diffusion / jump heads
-    ↓
-mispricing.py + MarkovSimulationEngine
-    ↓
-fair_up_probability
-fair_token_price
-    ↓
-buy_edge / hold_edge / sell_edge
+drift / diffusion / jump heads for latent-state research
 ```
 
 ## Core Principles
@@ -139,14 +177,16 @@ Implemented:
 - `L_t v1` latent/mechanism features
 - structured transition targets for `P(S_{t+Δ} | S_t)`
 - first transition model with drift / diffusion / jump outputs
-- MCMC-based fair pricing replay
-  - now using repeated next-state rollout by default when a trained transition model is available
+- Monte Carlo spot-terminal binary payoff pricing replay
+  - replay pricing currently consumes `event_state`
+  - each path is priced by whether terminal spot finishes above the market reference opening price
+  - current pricing replay does not require a trained transition-model artifact
 
 Current next-step focus:
 
-- strengthen the full transition kernel beyond the current v1 model
-- improve regime and jump modeling
-- connect the learned transition model more tightly to pricing
+- strengthen the latent-state transition research track
+- improve regime and jump modeling for state evolution
+- continue validating spot-terminal binary payoff pricing against market edge behavior
 
 ## Quick Start
 
@@ -176,6 +216,8 @@ Build event state:
 venv/bin/python scripts/build_event_state.py
 ```
 
+Optional transition research:
+
 Build transition targets:
 
 ```bash
@@ -196,6 +238,30 @@ venv/bin/python scripts/replay_pricing.py --pricing-method markov_mcmc
 
 `replay_pricing.py` now consumes serialized `event_state` rows directly and reads
 `data/processed/crypto_5m_event_state_latest.parquet` by default.
+
+You do not need to fit a transition model before running the current pricing
+replay path.
+
+Useful replay options:
+
+```bash
+venv/bin/python scripts/replay_pricing.py \
+  --n-samples 500 \
+  --simulation-dt-seconds 1.0 \
+  --rollout-horizon-seconds 1.0 \
+  --fallback-spot-volatility-per-sqrt-second 0.0005
+```
+
+The replay output includes:
+
+- `fair_up_probability`
+- `fair_token_price`
+- `buy_edge`
+- `hold_edge`
+- `sell_edge`
+- `risk_score`
+- `simulation_mode = spot_terminal_binary_payoff_rollout`
+- `rollout_kernel = spot_jump_diffusion`
 
 Run tests:
 

@@ -29,39 +29,28 @@ class MispricingDetectorConfig:
     """Configuration for path-integrated MCMC pricing."""
 
     pricing_method: str = "markov_mcmc"
-    drift: float = 0.0
-    fallback_volatility_per_sqrt_second: float = 0.0005
-    volatility_window_seconds: float = 120.0
-    event_duration_seconds: float = 300.0
+    spot_log_drift_per_second: float = 0.0
+    fallback_spot_volatility_per_sqrt_second: float = 0.0005
     n_samples: int = 1_000
     simulation_dt_seconds: float = 1.0
     rollout_horizon_seconds: float = 0.0
-    logit_diffusion_vol: float = 0.05
-    logit_jump_intensity: float = 0.01
-    logit_jump_mean: float = 0.0
-    logit_jump_std: float = 0.20
-    latent_anchor_weight: float = 0.35
-    latent_observation_std: float = 0.03
-    latent_observation_spread_scale: float = 4.0
-    imbalance_drift_scale: float = 0.35
-    volatility_variance_scale: float = 0.35
-    liquidity_variance_scale: float = 0.30
-    velocity_variance_scale: float = 0.50
-    boundary_variance_scale: float = 0.25
-    jump_intensity_scale: float = 0.50
+    spot_jump_intensity_per_second: float = 0.01
+    spot_jump_log_return_mean: float = 0.0
+    spot_jump_log_return_std: float = 0.20
+    liquidity_volatility_scale: float = 0.30
+    velocity_volatility_scale: float = 0.50
     edge_threshold: float = 0.0
     max_allowed_risk: float = 0.10
     seed: Optional[int] = 42
 
 
 class RealTimeMispricingDetector:
-    """Estimate fair token prices by simulating latent-state paths forward in time."""
+    """Estimate fair token prices from terminal binary spot payoffs."""
 
     def __init__(
         self,
         config: Optional[MispricingDetectorConfig] = None,
         pricing_model=None,
-        transition_bundle: Any | None = None,
     ) -> None:
         self.config = config or MispricingDetectorConfig()
         if str(self.config.pricing_method).strip().lower() != "markov_mcmc":
@@ -69,24 +58,18 @@ class RealTimeMispricingDetector:
         self.pricing_model = pricing_model
         self.engine = MarkovSimulationEngine(
             MarkovSimulationParams(
-                drift=self.config.drift,
-                diffusion_vol=self.config.logit_diffusion_vol,
-                jump_intensity=self.config.logit_jump_intensity,
-                jump_mean=self.config.logit_jump_mean,
-                jump_std=self.config.logit_jump_std,
-                dt_seconds=self.config.simulation_dt_seconds,
+                spot_log_drift_per_second=self.config.spot_log_drift_per_second,
+                base_spot_volatility_per_sqrt_second=self.config.fallback_spot_volatility_per_sqrt_second,
+                spot_jump_intensity_per_second=self.config.spot_jump_intensity_per_second,
+                spot_jump_log_return_mean=self.config.spot_jump_log_return_mean,
+                spot_jump_log_return_std=self.config.spot_jump_log_return_std,
+                simulation_dt_seconds=self.config.simulation_dt_seconds,
                 n_paths=self.config.n_samples,
-                imbalance_drift_scale=self.config.imbalance_drift_scale,
-                volatility_variance_scale=self.config.volatility_variance_scale,
-                liquidity_variance_scale=self.config.liquidity_variance_scale,
-                velocity_variance_scale=self.config.velocity_variance_scale,
-                boundary_variance_scale=self.config.boundary_variance_scale,
-                jump_intensity_scale=self.config.jump_intensity_scale,
+                liquidity_volatility_scale=self.config.liquidity_volatility_scale,
+                velocity_volatility_scale=self.config.velocity_volatility_scale,
                 rollout_horizon_seconds=self.config.rollout_horizon_seconds,
             ),
             pricing_model=self.pricing_model,
-            transition_bundle=transition_bundle,
-            event_duration_seconds=self.config.event_duration_seconds,
         )
 
     def detect(
@@ -122,21 +105,12 @@ class RealTimeMispricingDetector:
             if event_state_row is None:
                 continue
 
-            seconds_to_end = self._to_float(event_rows[0].get("seconds_to_end"))
-            latent_up_probability = self._to_float(event_rows[0].get("latent_up_probability"))
-            if (
-                seconds_to_end is None
-                or not np.isfinite(seconds_to_end)
-                or seconds_to_end < 0
-                or latent_up_probability is None
-                or not np.isfinite(latent_up_probability)
-            ):
+            if not self._has_pricing_inputs(event_state_row):
                 continue
 
             market_state = self._simulation_market_state(event_rows)
             simulation = self.engine.simulate(
-                initial_probability=float(np.clip(latent_up_probability, 1e-6, 1.0 - 1e-6)),
-                horizon_seconds=seconds_to_end,
+                horizon_seconds=float(max(self._to_float(event_state_row.get("seconds_to_end")) or 0.0, 0.0)),
                 market_state=market_state,
                 initial_event_state=event_state_row,
                 seed=self.config.seed,
@@ -171,54 +145,24 @@ class RealTimeMispricingDetector:
 
         valid_rows: list[dict[str, Any]] = []
         for event_state_row in event_state_rows:
-            seconds_to_end = self._to_float(event_state_row.get("seconds_to_end"))
-            latent_up_probability = self._to_float(event_state_row.get("latent_up_probability"))
-            if (
-                seconds_to_end is None
-                or not np.isfinite(seconds_to_end)
-                or seconds_to_end < 0
-                or latent_up_probability is None
-                or not np.isfinite(latent_up_probability)
-            ):
-                continue
-            valid_rows.append(event_state_row)
+            if self._has_pricing_inputs(event_state_row):
+                valid_rows.append(event_state_row)
 
         if not valid_rows:
             return valuation_rows
 
-        if self.engine.transition_bundle is not None:
-            total_progress = self._estimated_batch_rollout_steps(valid_rows)
-            with self._progress_manager(
-                total=total_progress,
-                description=progress_description,
-                enabled=show_progress,
-            ) as progress:
-                simulations = self.engine.simulate_event_state_batch(
-                    initial_event_states=valid_rows,
-                    seed=self.config.seed,
-                    progress_callback=progress.update if progress is not None else None,
-                )
-            row_simulations = zip(valid_rows, simulations)
-        else:
-            row_simulations = (
-                (
-                    event_state_row,
-                    self.engine.simulate(
-                        initial_probability=float(
-                            np.clip(self._to_float(event_state_row.get("latent_up_probability")), 1e-6, 1.0 - 1e-6)
-                        ),
-                        horizon_seconds=float(self._to_float(event_state_row.get("seconds_to_end"))),
-                        market_state=self._simulation_market_state_from_event_state(event_state_row),
-                        initial_event_state=event_state_row,
-                        seed=self.config.seed,
-                    ),
-                )
-                for event_state_row in self._iter_with_progress(
-                    list(valid_rows),
-                    show_progress=show_progress,
-                    description=progress_description,
-                )
+        total_progress = self._estimated_batch_rollout_steps(valid_rows)
+        with self._progress_manager(
+            total=total_progress,
+            description=progress_description,
+            enabled=show_progress,
+        ) as progress:
+            simulations = self.engine.simulate_event_state_batch(
+                initial_event_states=valid_rows,
+                seed=self.config.seed,
+                progress_callback=progress.update if progress is not None else None,
             )
+        row_simulations = zip(valid_rows, simulations)
 
         for event_state_row, simulation in row_simulations:
             up_distribution = simulation.aggregate(self.pricing_model, invert_probability=False)
@@ -247,10 +191,14 @@ class RealTimeMispricingDetector:
 
         return {
             "pricing_method": "markov_mcmc",
-            "pricing_source": "markov_path_integrated_pricing",
+            "pricing_source": "spot_terminal_binary_payoff_pricing",
             "market_implied_up_probability": market_implied_up_probability,
             "fundamental_up_probability": fundamental_up_probability,
             "latent_up_probability": latent_up_probability,
+            "reference_spot_price": self._to_float(event_state_row.get("reference_spot_price")),
+            # This is the direct binary payoff estimate:
+            # across simulated terminal spot paths, how often does spot_T finish
+            # above the market's reference opening price?
             "expected_terminal_up_probability": simulation.expected_terminal_probability,
             "terminal_probability_std": simulation.terminal_probability_std,
             "fair_up_probability": simulation.expected_terminal_probability,
@@ -263,12 +211,13 @@ class RealTimeMispricingDetector:
             "simulation_n_steps": simulation.diagnostics.get("n_steps"),
             "simulation_dt_seconds": simulation.diagnostics.get("dt_seconds"),
             "simulation_mode": simulation.diagnostics.get("simulation_mode"),
-            "conditioned_drift": simulation.diagnostics.get("conditioned_drift"),
-            "conditioned_diffusion": simulation.diagnostics.get("conditioned_diffusion"),
-            "conditioned_jump_intensity": simulation.diagnostics.get("conditioned_jump_intensity"),
-            "mean_jump_intensity_hat": simulation.diagnostics.get("mean_jump_intensity_hat"),
+            "conditioned_spot_log_drift_per_second": simulation.diagnostics.get("conditioned_spot_log_drift_per_second"),
+            "conditioned_spot_volatility_per_sqrt_second": simulation.diagnostics.get("conditioned_spot_volatility_per_sqrt_second"),
+            "conditioned_spot_jump_intensity_per_second": simulation.diagnostics.get("conditioned_spot_jump_intensity_per_second"),
             "rollout_horizon_seconds": simulation.diagnostics.get("rollout_horizon_seconds"),
             "rollout_kernel": simulation.diagnostics.get("rollout_kernel"),
+            "terminal_spot_mean": simulation.diagnostics.get("terminal_spot_mean"),
+            "terminal_spot_std": simulation.diagnostics.get("terminal_spot_std"),
         }
 
     def _valuation_row(
@@ -353,16 +302,6 @@ class RealTimeMispricingDetector:
         up_row = next((row for row in event_rows if str(row.get("outcome_name", "")).lower() == "up"), None)
         down_row = next((row for row in event_rows if str(row.get("outcome_name", "")).lower() == "down"), None)
 
-        up_imbalance = self._row_market_signal(up_row, "weighted_imbalance", "orderbook_imbalance")
-        down_imbalance = self._row_market_signal(down_row, "weighted_imbalance", "orderbook_imbalance")
-        imbalance_signal = self._nanmean_or_default(
-            [
-                self._nan_if_none(up_imbalance),
-                -self._nan_if_none(down_imbalance),
-            ],
-            default=0.0,
-        )
-
         liquidity_depth = self._nanmin_or_default(
             [
                 self._nan_if_none(self._row_market_signal(up_row, "bid_depth_top_5")),
@@ -382,44 +321,18 @@ class RealTimeMispricingDetector:
         )
 
         spot_vol_multiplier = self._to_float(event_rows[0].get("spot_vol_multiplier")) or 1.0
-        cross_book_basis = self._to_float(event_rows[0].get("cross_book_basis"))
-        if cross_book_basis is None:
-            up_mid = self._row_market_signal(up_row, "micro_price", "mid_price")
-            down_mid = self._row_market_signal(down_row, "micro_price", "mid_price")
-            if up_mid is not None and down_mid is not None:
-                cross_book_basis = up_mid + down_mid - 1.0
-            else:
-                cross_book_basis = 0.0
-
-        boundary_distance = self._to_float(event_rows[0].get("dist_to_boundary"))
-        if boundary_distance is None or not np.isfinite(boundary_distance):
-            latent_probability = self._to_float(event_rows[0].get("latent_up_probability"))
-            if latent_probability is None or not np.isfinite(latent_probability):
-                latent_probability = 0.5
-            boundary_distance = float(min(latent_probability, 1.0 - latent_probability))
 
         return SimulationMarketState(
-            imbalance_signal=imbalance_signal,
+            spot_price=self._to_float(event_rows[0].get("spot_price")),
+            reference_spot_price=self._to_float(event_rows[0].get("reference_spot_price")),
+            spot_volatility_per_sqrt_second=self._to_float(event_rows[0].get("volatility_per_sqrt_second"))
+            or self.config.fallback_spot_volatility_per_sqrt_second,
             liquidity_depth=liquidity_depth,
             book_velocity=book_velocity,
             spot_vol_multiplier=spot_vol_multiplier,
-            cross_book_basis=cross_book_basis,
-            boundary_distance=boundary_distance,
         )
 
     def _simulation_market_state_from_event_state(self, event_state_row: Dict[str, Any]) -> SimulationMarketState:
-        up_imbalance = self._to_float(event_state_row.get("up_weighted_imbalance"))
-        if up_imbalance is None:
-            up_imbalance = self._to_float(event_state_row.get("up_orderbook_imbalance"))
-
-        down_imbalance = self._to_float(event_state_row.get("down_weighted_imbalance"))
-        if down_imbalance is None:
-            down_imbalance = self._to_float(event_state_row.get("down_orderbook_imbalance"))
-
-        imbalance_signal = self._nanmean_or_default(
-            [self._nan_if_none(up_imbalance), -self._nan_if_none(down_imbalance)],
-            default=0.0,
-        )
         liquidity_depth = self._nanmin_or_default(
             [
                 self._nan_if_none(self._to_float(event_state_row.get("up_bid_depth_top_5"))),
@@ -437,21 +350,31 @@ class RealTimeMispricingDetector:
             default=0.0,
         )
         spot_vol_multiplier = self._to_float(event_state_row.get("spot_vol_multiplier")) or 1.0
-        cross_book_basis = self._to_float(event_state_row.get("cross_book_basis")) or 0.0
-        boundary_distance = self._to_float(event_state_row.get("dist_to_boundary"))
-        if boundary_distance is None or not np.isfinite(boundary_distance):
-            latent_probability = self._to_float(event_state_row.get("latent_up_probability"))
-            if latent_probability is None or not np.isfinite(latent_probability):
-                latent_probability = 0.5
-            boundary_distance = float(min(latent_probability, 1.0 - latent_probability))
 
         return SimulationMarketState(
-            imbalance_signal=imbalance_signal,
+            spot_price=self._to_float(event_state_row.get("spot_price")),
+            reference_spot_price=self._to_float(event_state_row.get("reference_spot_price")),
+            spot_volatility_per_sqrt_second=self._to_float(event_state_row.get("volatility_per_sqrt_second"))
+            or self.config.fallback_spot_volatility_per_sqrt_second,
             liquidity_depth=liquidity_depth,
             book_velocity=book_velocity,
             spot_vol_multiplier=spot_vol_multiplier,
-            cross_book_basis=cross_book_basis,
-            boundary_distance=boundary_distance,
+        )
+
+    def _has_pricing_inputs(self, row: Dict[str, Any]) -> bool:
+        seconds_to_end = self._to_float(row.get("seconds_to_end"))
+        spot_price = self._to_float(row.get("spot_price"))
+        reference_spot_price = self._to_float(row.get("reference_spot_price"))
+        return bool(
+            seconds_to_end is not None
+            and np.isfinite(seconds_to_end)
+            and seconds_to_end >= 0
+            and spot_price is not None
+            and np.isfinite(spot_price)
+            and spot_price > 0
+            and reference_spot_price is not None
+            and np.isfinite(reference_spot_price)
+            and reference_spot_price > 0
         )
 
     def _row_market_signal(self, row: Optional[Dict[str, Any]], *columns: str) -> Optional[float]:
@@ -531,13 +454,10 @@ class RealTimeMispricingDetector:
     def _estimated_batch_rollout_steps(self, rows: List[Dict[str, Any]]) -> int:
         if not rows:
             return 0
-        if self.engine.transition_bundle is None:
-            return len(rows)
-
         if self.config.rollout_horizon_seconds > 0.0:
             step_seconds = float(self.config.rollout_horizon_seconds)
         else:
-            step_seconds = float(getattr(self.engine.transition_bundle, "default_step_seconds", 0.0) or 0.0)
+            step_seconds = float(self.config.simulation_dt_seconds)
 
         if step_seconds <= 0.0:
             return len(rows)

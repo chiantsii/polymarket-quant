@@ -77,8 +77,8 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
     detector = RealTimeMispricingDetector(
         MispricingDetectorConfig(
             n_samples=512,
-            logit_diffusion_vol=0.0,
-            logit_jump_intensity=0.0,
+            fallback_spot_volatility_per_sqrt_second=0.0,
+            spot_jump_intensity_per_second=0.0,
             edge_threshold=0.01,
             max_allowed_risk=0.05,
             seed=42,
@@ -116,7 +116,7 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
     assert up_valuation["pricing_method"] == "markov_mcmc"
     assert up_valuation["buy_edge"] > 0.10
     assert up_valuation["buy_signal"] is True
-    assert up_valuation["risk_score"] == pytest.approx(0.0)
+    assert 0.0 <= up_valuation["risk_score"] < detector.config.max_allowed_risk
     assert 0.0 <= up_valuation["fair_up_probability"] <= 1.0
     assert down_valuation["fair_token_price"] == pytest.approx(1.0 - up_valuation["fair_up_probability"])
     assert "signal" not in up_valuation
@@ -147,9 +147,9 @@ def test_mispricing_detector_applies_risk_gate_to_buy_signal(monkeypatch: pytest
         diagnostics = {
             "n_steps": 10,
             "dt_seconds": 1.0,
-            "conditioned_drift": 0.0,
-            "conditioned_diffusion": 0.2,
-            "conditioned_jump_intensity": 0.05,
+            "conditioned_spot_log_drift_per_second": 0.0,
+            "conditioned_spot_volatility_per_sqrt_second": 0.2,
+            "conditioned_spot_jump_intensity_per_second": 0.05,
         }
 
         def aggregate(self, pricing_model=None, invert_probability: bool = False):
@@ -176,8 +176,8 @@ def test_mispricing_detector_does_not_emit_toxicity_from_valuation_layer() -> No
     detector = RealTimeMispricingDetector(
         MispricingDetectorConfig(
             n_samples=256,
-            logit_diffusion_vol=0.0,
-            logit_jump_intensity=0.0,
+            fallback_spot_volatility_per_sqrt_second=0.0,
+            spot_jump_intensity_per_second=0.0,
             seed=42,
         )
     )
@@ -207,7 +207,7 @@ def test_only_markov_mcmc_pricing_method_is_supported() -> None:
         )
 
 
-def test_mispricing_detector_skips_nan_latent_probability() -> None:
+def test_mispricing_detector_prices_when_spot_inputs_exist_even_if_latent_probability_is_nan() -> None:
     detector = RealTimeMispricingDetector(MispricingDetectorConfig(seed=42))
 
     valuations = detector.detect(
@@ -217,7 +217,8 @@ def test_mispricing_detector_skips_nan_latent_probability() -> None:
         ]
     )
 
-    assert valuations == []
+    assert len(valuations) == 2
+    assert all(0.0 <= row["fair_up_probability"] <= 1.0 for row in valuations)
 
 
 def test_simulation_market_state_handles_missing_side_signals_without_warning() -> None:
@@ -240,7 +241,7 @@ def test_simulation_market_state_handles_missing_side_signals_without_warning() 
         ]
     )
 
-    assert state.imbalance_signal == 0.0
     assert state.liquidity_depth == 0.0
     assert state.book_velocity == 0.0
-    assert 0.0 <= state.boundary_distance <= 0.5
+    assert state.spot_vol_multiplier == pytest.approx(1.0)
+    assert state.spot_volatility_per_sqrt_second > 0.0
