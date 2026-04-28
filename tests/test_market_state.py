@@ -12,6 +12,7 @@ from polymarket_quant.state import (
     load_orderbook_raw_glob,
     load_spot_raw_glob,
 )
+from polymarket_quant.state.dataset import filter_complete_event_windows
 
 
 def _orderbook_row(timestamp, event_slug: str, outcome_name: str, token_id: str, best_bid: float, best_ask: float):
@@ -51,8 +52,8 @@ def _orderbook_row(timestamp, event_slug: str, outcome_name: str, token_id: str,
 def _spot_row(timestamp, price: float):
     return {
         "asset": "BTC",
-        "product_id": "BTC-USD",
-        "source": "coinbase",
+        "product_id": "BTCUSDT",
+        "source": "binance_book_ticker",
         "collected_at": timestamp.isoformat(),
         "exchange_time": timestamp.isoformat(),
         "price": price,
@@ -62,6 +63,12 @@ def _spot_row(timestamp, price: float):
         "volume": 100.0,
         "trade_id": 1,
     }
+
+
+def _spot_row_for_event(timestamp, event_slug: str, price: float):
+    row = _spot_row(timestamp, price)
+    row["event_slug"] = event_slug
+    return row
 
 
 def _orderbook_levels_rows(timestamp, event_slug: str, outcome_name: str, token_id: str):
@@ -241,8 +248,8 @@ def test_load_orderbook_and_spot_raw_glob_builds_frames(tmp_path) -> None:
     spot_payload = [
         {
             "asset": "BTC",
-            "product_id": "BTC-USD",
-            "source": "coinbase",
+            "product_id": "BTCUSDT",
+            "source": "binance_book_ticker",
             "collected_at": (start + timedelta(seconds=1)).isoformat(),
             "exchange_time": (start + timedelta(seconds=1)).isoformat(),
             "price": 101.0,
@@ -254,13 +261,14 @@ def test_load_orderbook_and_spot_raw_glob_builds_frames(tmp_path) -> None:
         }
     ]
 
-    raw_dir = tmp_path / "raw"
-    raw_dir.mkdir()
+    raw_dir = tmp_path / "BTC" / "raw" / "polymarket"
+    raw_dir.mkdir(parents=True)
     (raw_dir / "crypto_5m_orderbooks_raw_20260408_173000.json").write_text(json.dumps(orderbook_payload))
-    (raw_dir / "crypto_spot_ticks_raw_20260408_173000.json").write_text(json.dumps(spot_payload))
+    (tmp_path / "BTC" / "raw" / "spot").mkdir(parents=True)
+    (tmp_path / "BTC" / "raw" / "spot" / "binance_spot_ticks_20260408_173000.json").write_text(json.dumps(spot_payload))
 
-    orderbooks = load_orderbook_raw_glob(str(raw_dir / "crypto_5m_orderbooks_raw_*.json"))
-    spot = load_spot_raw_glob(str(raw_dir / "crypto_spot_ticks_raw_*.json"))
+    orderbooks = load_orderbook_raw_glob(str(tmp_path / "*" / "raw" / "polymarket" / "crypto_5m_orderbooks_raw_*.json"))
+    spot = load_spot_raw_glob(str(tmp_path / "*" / "raw" / "spot" / "binance_spot_ticks_*.json"))
 
     assert len(orderbooks) == 1
     assert len(spot) == 1
@@ -296,8 +304,8 @@ def test_build_event_state_dataset_collapses_up_and_down_rows() -> None:
                 "book_velocity": 0.0,
                 "state_timestamp": ts_1.isoformat(),
                 "book_age_seconds": 0.0,
-                "spot_source": "coinbase",
-                "spot_product_id": "BTC-USD",
+                "spot_source": "binance_book_ticker",
+                "spot_product_id": "BTCUSDT",
                 "spot_exchange_time": ts_1.isoformat(),
                 "spot_bid": 100.99,
                 "spot_ask": 101.01,
@@ -322,8 +330,8 @@ def test_build_event_state_dataset_collapses_up_and_down_rows() -> None:
                 "book_velocity": 0.0,
                 "state_timestamp": ts_1.isoformat(),
                 "book_age_seconds": 0.0,
-                "spot_source": "coinbase",
-                "spot_product_id": "BTC-USD",
+                "spot_source": "binance_book_ticker",
+                "spot_product_id": "BTCUSDT",
                 "spot_exchange_time": ts_1.isoformat(),
                 "spot_bid": 100.99,
                 "spot_ask": 101.01,
@@ -348,8 +356,8 @@ def test_build_event_state_dataset_collapses_up_and_down_rows() -> None:
                 "book_velocity": 0.2,
                 "state_timestamp": ts_2.isoformat(),
                 "book_age_seconds": 0.0,
-                "spot_source": "coinbase",
-                "spot_product_id": "BTC-USD",
+                "spot_source": "binance_book_ticker",
+                "spot_product_id": "BTCUSDT",
                 "spot_exchange_time": ts_2.isoformat(),
                 "spot_bid": 101.49,
                 "spot_ask": 101.51,
@@ -374,8 +382,8 @@ def test_build_event_state_dataset_collapses_up_and_down_rows() -> None:
                 "book_velocity": 0.18,
                 "state_timestamp": ts_2.isoformat(),
                 "book_age_seconds": 0.0,
-                "spot_source": "coinbase",
-                "spot_product_id": "BTC-USD",
+                "spot_source": "binance_book_ticker",
+                "spot_product_id": "BTCUSDT",
                 "spot_exchange_time": ts_2.isoformat(),
                 "spot_bid": 101.49,
                 "spot_ask": 101.51,
@@ -448,6 +456,76 @@ def test_build_market_state_dataset_skips_rows_without_trustworthy_timestamp() -
             spot_tolerance_seconds=2.0,
             event_duration_seconds=300.0,
         )
+
+
+def test_filter_complete_event_windows_keeps_only_full_event_slug_coverage() -> None:
+    slug_a = "btc-updown-5m-1775578800"
+    slug_b = "btc-updown-5m-1775579100"
+    slug_c = "btc-updown-5m-1775579400"
+    slug_d = "btc-updown-5m-1775579700"
+    start_a = datetime.fromtimestamp(1775578800, tz=timezone.utc)
+    start_b = datetime.fromtimestamp(1775579100, tz=timezone.utc)
+    start_c = datetime.fromtimestamp(1775579400, tz=timezone.utc)
+    start_d = datetime.fromtimestamp(1775579700, tz=timezone.utc)
+    end_a = start_a + timedelta(minutes=5)
+    end_b = start_b + timedelta(minutes=5)
+    end_c = start_c + timedelta(minutes=5)
+    end_d = start_d + timedelta(minutes=5)
+
+    orderbooks = pd.DataFrame(
+        [
+            _orderbook_row(start_a + timedelta(seconds=1), slug_a, "Up", "tok_up_a", 0.50, 0.51),
+            _orderbook_row(start_a + timedelta(seconds=1), slug_a, "Down", "tok_down_a", 0.48, 0.49),
+            _orderbook_row(end_a - timedelta(seconds=1), slug_a, "Up", "tok_up_a", 0.52, 0.53),
+            _orderbook_row(end_a - timedelta(seconds=1), slug_a, "Down", "tok_down_a", 0.46, 0.47),
+            _orderbook_row(start_b + timedelta(seconds=1), slug_b, "Up", "tok_up_b", 0.50, 0.51),
+            _orderbook_row(start_b + timedelta(seconds=1), slug_b, "Down", "tok_down_b", 0.48, 0.49),
+            _orderbook_row(end_b - timedelta(seconds=1), slug_b, "Up", "tok_up_b", 0.52, 0.53),
+            _orderbook_row(end_b - timedelta(seconds=1), slug_b, "Down", "tok_down_b", 0.46, 0.47),
+            _orderbook_row(start_c + timedelta(seconds=1), slug_c, "Up", "tok_up_c", 0.50, 0.51),
+            _orderbook_row(start_c + timedelta(seconds=1), slug_c, "Down", "tok_down_c", 0.48, 0.49),
+            _orderbook_row(end_c - timedelta(seconds=1), slug_c, "Up", "tok_up_c", 0.52, 0.53),
+            _orderbook_row(end_c - timedelta(seconds=1), slug_c, "Down", "tok_down_c", 0.46, 0.47),
+            _orderbook_row(start_d + timedelta(seconds=1), slug_d, "Up", "tok_up_d", 0.50, 0.51),
+            _orderbook_row(start_d + timedelta(seconds=1), slug_d, "Down", "tok_down_d", 0.48, 0.49),
+            _orderbook_row(end_d - timedelta(seconds=1), slug_d, "Up", "tok_up_d", 0.52, 0.53),
+            _orderbook_row(end_d - timedelta(seconds=1), slug_d, "Down", "tok_down_d", 0.46, 0.47),
+        ]
+    )
+    orderbook_levels = pd.DataFrame(
+        _orderbook_levels_rows(start_a + timedelta(seconds=1), slug_a, "Up", "tok_up_a")
+        + _orderbook_levels_rows(start_a + timedelta(seconds=1), slug_a, "Down", "tok_down_a")
+        + _orderbook_levels_rows(start_b + timedelta(seconds=1), slug_b, "Up", "tok_up_b")
+        + _orderbook_levels_rows(start_b + timedelta(seconds=1), slug_b, "Down", "tok_down_b")
+        + _orderbook_levels_rows(start_c + timedelta(seconds=1), slug_c, "Up", "tok_up_c")
+        + _orderbook_levels_rows(start_c + timedelta(seconds=1), slug_c, "Down", "tok_down_c")
+        + _orderbook_levels_rows(start_d + timedelta(seconds=1), slug_d, "Up", "tok_up_d")
+        + _orderbook_levels_rows(start_d + timedelta(seconds=1), slug_d, "Down", "tok_down_d")
+    )
+    spot = pd.DataFrame(
+        [
+            _spot_row_for_event(start_a + timedelta(seconds=1), slug_a, 100.0),
+            _spot_row_for_event(end_a - timedelta(seconds=1), slug_a, 101.0),
+            _spot_row_for_event(start_b + timedelta(seconds=1), slug_b, 102.0),
+            _spot_row_for_event(end_b - timedelta(seconds=1), slug_b, 103.0),
+            _spot_row_for_event(start_c + timedelta(seconds=1), slug_c, 104.0),
+            _spot_row_for_event(end_c - timedelta(seconds=1), slug_c, 105.0),
+            _spot_row_for_event(start_d + timedelta(seconds=1), slug_d, 106.0),
+            _spot_row_for_event(end_d - timedelta(seconds=1), slug_d, 107.0),
+        ]
+    )
+
+    filtered_orderbooks, filtered_spot, filtered_levels = filter_complete_event_windows(
+        orderbooks=orderbooks,
+        spot=spot,
+        orderbook_levels=orderbook_levels,
+        event_duration_seconds=300.0,
+        coverage_tolerance_seconds=2.0,
+    )
+
+    assert set(filtered_orderbooks["event_slug"]) == {slug_b, slug_c}
+    assert set(filtered_levels["event_slug"]) == {slug_b, slug_c}
+    assert len(filtered_spot) == len(spot)
 
 
 def test_fundamental_probability_uses_gbm_terminal_crossing_probability() -> None:

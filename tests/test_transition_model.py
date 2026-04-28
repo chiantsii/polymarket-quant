@@ -117,6 +117,7 @@ def _synthetic_transition_targets(n_rows: int = 96) -> pd.DataFrame:
             "current_regime_shock_posterior": current_regimes[1],
             "current_regime_convergence_posterior": current_regimes[2],
             "future_market_implied_up_probability": 0.5 + 0.5 * (basis + 0.25 * delta_latent_logit),
+            "future_spot_return_since_reference": basis + 0.15 * delta_latent_logit,
             "future_up_micro_price": future_up_micro,
             "future_down_micro_price": future_down_micro,
             "future_up_bid_depth_top_5": 120.0 + 12.0 * max(imbalance + 0.1 * delta_latent_logit, 0.0),
@@ -168,6 +169,9 @@ def test_fit_transition_model_returns_structured_predictions() -> None:
     assert "mu_hat_latent_logit_probability" in predictions.columns
     assert "sigma_hat_latent_logit_probability" in predictions.columns
     assert "lambda_hat_latent_logit_probability" in predictions.columns
+    assert "mu_hat_log_spot_ratio" in predictions.columns
+    assert "sigma_hat_log_spot_ratio" in predictions.columns
+    assert "lambda_hat_log_spot_ratio" in predictions.columns
     assert "jump_probability_hat_latent_logit_probability" in predictions.columns
     assert "future_hat_regime_normal_posterior" in predictions.columns
     assert "jump_intensity_hat" in predictions.columns
@@ -182,8 +186,11 @@ def test_fit_transition_model_returns_structured_predictions() -> None:
     assert "current_latent_logit_probability" in fit_result.summary["rollout_feature_columns"]
     assert "current_market_implied_up_probability" not in fit_result.summary["rollout_feature_columns"]
     assert "parametric_latent_kernel" in fit_result.summary
+    assert "parametric_spot_kernel" in fit_result.summary
     assert fit_result.summary["parametric_latent_kernel"]["target"] == "latent_logit_probability"
+    assert fit_result.summary["parametric_spot_kernel"]["target"] == "log_spot_ratio"
     assert "mu_hat_latent_logit_probability" in fit_result.summary["parametric_latent_kernel"]["kernel_columns"]
+    assert "mu_hat_log_spot_ratio" in fit_result.summary["parametric_spot_kernel"]["kernel_columns"]
     assert fit_result.summary["parametric_latent_kernel"]["step_seconds_median"] == pytest.approx(15.0)
     assert "latent_logit_probability" in fit_result.summary["target_metrics"]
 

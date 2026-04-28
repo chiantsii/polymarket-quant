@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timezone
+import joblib
 from pathlib import Path
 from typing import Any
 
@@ -13,15 +14,32 @@ from polymarket_quant.utils.logger import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_EVENT_STATE_GLOB = "data/processed/crypto_5m_event_state_latest.parquet"
+DEFAULT_TRANSITION_MODEL_PATH = "artifacts/transition_model/transition_model_latest.joblib"
+
+
+def _validate_transition_bundle(bundle: Any) -> None:
+    required_attributes = (
+        "spot_mu_model",
+        "spot_sigma_model",
+        "spot_jump_model",
+    )
+    missing = [attribute for attribute in required_attributes if getattr(bundle, attribute, None) is None]
+    if missing:
+        raise ValueError(
+            "Transition model artifact does not contain the learned spot kernel required for pricing. "
+            f"Missing: {missing}. Re-run scripts/fit_transition_model.py to refresh the artifact."
+        )
+
+
 def _build_detector_config(
     *,
     pricing_method: str,
     n_samples: int,
     fallback_spot_volatility_per_sqrt_second: float,
     edge_threshold: float,
-    max_allowed_risk: float,
     simulation_dt_seconds: float,
     rollout_horizon_seconds: float,
+    transition_bundle: Any,
 ) -> MispricingDetectorConfig:
     """Create the canonical pricing/state assumption bundle for replay."""
     return MispricingDetectorConfig(
@@ -29,9 +47,9 @@ def _build_detector_config(
         n_samples=n_samples,
         fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
-        max_allowed_risk=max_allowed_risk,
         simulation_dt_seconds=simulation_dt_seconds,
         rollout_horizon_seconds=rollout_horizon_seconds,
+        transition_bundle=transition_bundle,
     )
 
 
@@ -42,9 +60,10 @@ def replay_pricing(
     n_samples: int = 1_000,
     fallback_spot_volatility_per_sqrt_second: float = 0.0005,
     edge_threshold: float = 0.0,
-    max_allowed_risk: float = 0.10,
     simulation_dt_seconds: float = 1.0,
     rollout_horizon_seconds: float = 0.0,
+    transition_model_path: str = DEFAULT_TRANSITION_MODEL_PATH,
+    transition_bundle: Any | None = None,
     max_rows: int | None = None,
     show_progress: bool = False,
     include_latest: bool = False,
@@ -57,15 +76,24 @@ def replay_pricing(
     while `replay_pricing.py` only consumes `event_state` rows and prices them.
     """
     event_state = load_parquet_glob(event_state_glob, include_latest=include_latest)
+    if transition_bundle is None:
+        bundle_path = Path(transition_model_path)
+        if not bundle_path.exists():
+            raise FileNotFoundError(
+                f"Transition model artifact not found at {transition_model_path}. "
+                "Run scripts/fit_transition_model.py before replay pricing."
+            )
+        transition_bundle = joblib.load(bundle_path)
+    _validate_transition_bundle(transition_bundle)
 
     detector_config = _build_detector_config(
         pricing_method=pricing_method,
         n_samples=n_samples,
         fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
-        max_allowed_risk=max_allowed_risk,
         simulation_dt_seconds=simulation_dt_seconds,
         rollout_horizon_seconds=rollout_horizon_seconds,
+        transition_bundle=transition_bundle,
     )
     if max_rows is not None:
         event_state = event_state.head(max(int(max_rows), 0)).copy()
@@ -178,6 +206,11 @@ def main() -> None:
         help="Pricing estimator to replay",
     )
     parser.add_argument("--n-samples", type=int, default=1_000, help="Simulation paths for pricing methods that require them")
+    parser.add_argument(
+        "--transition-model-path",
+        default=DEFAULT_TRANSITION_MODEL_PATH,
+        help="Transition model artifact used to learn state-conditioned spot-kernel parameters",
+    )
     parser.add_argument("--simulation-dt-seconds", type=float, default=1.0, help="Simulation step size in seconds")
     parser.add_argument(
         "--rollout-horizon-seconds",
@@ -193,7 +226,6 @@ def main() -> None:
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable progress output during pricing replay")
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Minimum edge required to signal a buy")
-    parser.add_argument("--max-allowed-risk", type=float, default=0.10, help="Maximum risk score allowed for a buy signal")
     parser.add_argument(
         "--fallback-spot-volatility-per-sqrt-second",
         type=float,
@@ -209,9 +241,9 @@ def main() -> None:
         pricing_method=args.pricing_method,
         n_samples=args.n_samples,
         edge_threshold=args.edge_threshold,
-        max_allowed_risk=args.max_allowed_risk,
         simulation_dt_seconds=args.simulation_dt_seconds,
         rollout_horizon_seconds=args.rollout_horizon_seconds,
+        transition_model_path=args.transition_model_path,
         max_rows=args.max_rows,
         show_progress=not args.no_progress,
         fallback_spot_volatility_per_sqrt_second=args.fallback_spot_volatility_per_sqrt_second,

@@ -62,7 +62,7 @@ def _state_row(
         "book_hash": "hash",
         "spot_price": 101.0,
         "reference_spot_price": 100.0,
-        "reference_source": "coinbase_1m_candle_open",
+        "reference_source": "binance_1m_kline_open",
         "seconds_to_end": 240.0,
         "market_implied_up_probability": market_implied_up_probability,
         "fundamental_up_probability": fundamental_up_probability,
@@ -80,7 +80,6 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
             fallback_spot_volatility_per_sqrt_second=0.0,
             spot_jump_intensity_per_second=0.0,
             edge_threshold=0.01,
-            max_allowed_risk=0.05,
             seed=42,
         )
     )
@@ -116,27 +115,25 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
     assert up_valuation["pricing_method"] == "markov_mcmc"
     assert up_valuation["buy_edge"] > 0.10
     assert up_valuation["buy_signal"] is True
-    assert 0.0 <= up_valuation["risk_score"] < detector.config.max_allowed_risk
     assert 0.0 <= up_valuation["fair_up_probability"] <= 1.0
     assert down_valuation["fair_token_price"] == pytest.approx(1.0 - up_valuation["fair_up_probability"])
     assert "signal" not in up_valuation
     assert "net_buy_edge" not in up_valuation
     assert "inventory_penalty" not in up_valuation
+    assert "risk_score" not in up_valuation
 
 
-def test_mispricing_detector_applies_risk_gate_to_buy_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mispricing_detector_buy_signal_depends_on_edge_only(monkeypatch: pytest.MonkeyPatch) -> None:
     detector = RealTimeMispricingDetector(
         MispricingDetectorConfig(
             edge_threshold=0.01,
-            max_allowed_risk=0.05,
             seed=42,
         )
     )
 
     class _FakeDistribution:
-        def __init__(self, expected_fair_price: float, risk_score: float) -> None:
+        def __init__(self, expected_fair_price: float) -> None:
             self.expected_fair_price = expected_fair_price
-            self.risk_score = risk_score
             self.n_paths = 1000
             self.diagnostics = {}
 
@@ -154,8 +151,8 @@ def test_mispricing_detector_applies_risk_gate_to_buy_signal(monkeypatch: pytest
 
         def aggregate(self, pricing_model=None, invert_probability: bool = False):
             if invert_probability:
-                return _FakeDistribution(0.38, 0.20)
-            return _FakeDistribution(0.62, 0.20)
+                return _FakeDistribution(0.38)
+            return _FakeDistribution(0.62)
 
     monkeypatch.setattr(detector.engine, "simulate", lambda **_: _FakeSimulation())
 
@@ -168,8 +165,8 @@ def test_mispricing_detector_applies_risk_gate_to_buy_signal(monkeypatch: pytest
 
     up_valuation = next(row for row in valuations if row["outcome_name"] == "Up")
     assert up_valuation["buy_edge"] > 0.01
-    assert up_valuation["risk_score"] == pytest.approx(0.20)
-    assert up_valuation["buy_signal"] is False
+    assert up_valuation["buy_signal"] is True
+    assert "risk_score" not in up_valuation
 
 
 def test_mispricing_detector_does_not_emit_toxicity_from_valuation_layer() -> None:

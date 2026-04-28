@@ -55,7 +55,6 @@ def test_markov_simulation_prices_deterministic_up_payoff() -> None:
     down_distribution = result.aggregate(invert_probability=True)
     assert up_distribution.expected_fair_price == pytest.approx(1.0)
     assert down_distribution.expected_fair_price == pytest.approx(0.0)
-    assert up_distribution.risk_score == pytest.approx(0.0)
 
 
 def test_markov_simulation_prices_deterministic_down_payoff() -> None:

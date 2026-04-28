@@ -144,10 +144,7 @@ def test_build_transition_target_dataset_pairs_current_and_future_state() -> Non
         ]
     )
 
-    targets = build_transition_target_dataset(
-        event_state,
-        config=TransitionTargetConfig(pairing_mode="horizon", horizons_seconds=(15.0,), tolerance_seconds=0.5),
-    )
+    targets = build_transition_target_dataset(event_state)
 
     assert len(targets) == 2
     assert targets["target_status"].eq("matched").all()
@@ -205,12 +202,7 @@ def test_build_transition_target_dataset_can_keep_unmatched_rows() -> None:
 
     targets = build_transition_target_dataset(
         event_state,
-        config=TransitionTargetConfig(
-            pairing_mode="horizon",
-            horizons_seconds=(15.0,),
-            tolerance_seconds=0.5,
-            include_unmatched=True,
-        ),
+        config=TransitionTargetConfig(include_unmatched=True),
     )
 
     assert len(targets) == 2
@@ -292,14 +284,12 @@ def test_build_transition_target_dataset_handles_multiple_events_with_global_tim
         ]
     )
 
-    targets = build_transition_target_dataset(
-        event_state,
-        config=TransitionTargetConfig(pairing_mode="horizon", horizons_seconds=(20.0,), tolerance_seconds=0.5),
-    )
+    targets = build_transition_target_dataset(event_state)
 
     assert len(targets) == 2
     assert set(targets["event_slug"]) == {event_a, event_b}
     assert targets["target_status"].eq("matched").all()
+    assert list(targets["realized_horizon_seconds"]) == [20.0, 20.0]
 
 
 def test_build_transition_target_dataset_defaults_to_next_observation_pairing() -> None:

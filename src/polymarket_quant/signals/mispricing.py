@@ -16,7 +16,7 @@ from polymarket_quant.pricing import (
     MarkovSimulationParams,
     SimulationMarketState,
 )
-from polymarket_quant.state import build_event_state_dataset
+from polymarket_quant.state import TransitionModelBundle, build_event_state_dataset
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -40,8 +40,8 @@ class MispricingDetectorConfig:
     liquidity_volatility_scale: float = 0.30
     velocity_volatility_scale: float = 0.50
     edge_threshold: float = 0.0
-    max_allowed_risk: float = 0.10
     seed: Optional[int] = 42
+    transition_bundle: TransitionModelBundle | None = None
 
 
 class RealTimeMispricingDetector:
@@ -70,6 +70,7 @@ class RealTimeMispricingDetector:
                 rollout_horizon_seconds=self.config.rollout_horizon_seconds,
             ),
             pricing_model=self.pricing_model,
+            transition_bundle=self.config.transition_bundle,
         )
 
     def detect(
@@ -151,9 +152,8 @@ class RealTimeMispricingDetector:
         if not valid_rows:
             return valuation_rows
 
-        total_progress = self._estimated_batch_rollout_steps(valid_rows)
         with self._progress_manager(
-            total=total_progress,
+            total=len(valid_rows),
             description=progress_description,
             enabled=show_progress,
         ) as progress:
@@ -188,6 +188,12 @@ class RealTimeMispricingDetector:
         market_implied_up_probability = self._to_float(event_state_row.get("market_implied_up_probability"))
         fundamental_up_probability = self._to_float(event_state_row.get("fundamental_up_probability"))
         latent_up_probability = self._to_float(event_state_row.get("latent_up_probability"))
+        empirical_cdf_at_reference_price = self._to_float(simulation.diagnostics.get("empirical_cdf_at_reference_price"))
+        fair_up_probability = (
+            float(1.0 - empirical_cdf_at_reference_price)
+            if empirical_cdf_at_reference_price is not None
+            else float(simulation.expected_terminal_probability)
+        )
 
         return {
             "pricing_method": "markov_mcmc",
@@ -197,15 +203,15 @@ class RealTimeMispricingDetector:
             "latent_up_probability": latent_up_probability,
             "reference_spot_price": self._to_float(event_state_row.get("reference_spot_price")),
             # This is the direct binary payoff estimate:
-            # across simulated terminal spot paths, how often does spot_T finish
-            # above the market's reference opening price?
+            # fair_up_probability = 1 - F_hat_T(K), where K is the market's
+            # reference opening spot price and F_hat_T is the empirical CDF of
+            # simulated terminal spot values.
             "expected_terminal_up_probability": simulation.expected_terminal_probability,
             "terminal_probability_std": simulation.terminal_probability_std,
-            "fair_up_probability": simulation.expected_terminal_probability,
+            "fair_up_probability": fair_up_probability,
+            "empirical_cdf_at_reference_price": empirical_cdf_at_reference_price,
             "expected_fair_up_price": up_distribution.expected_fair_price,
             "expected_fair_down_price": down_distribution.expected_fair_price,
-            "risk_score_up": up_distribution.risk_score,
-            "risk_score_down": down_distribution.risk_score,
             "pricing_standard_error": simulation.terminal_probability_std / np.sqrt(max(simulation.n_paths, 1)),
             "pricing_n_samples": simulation.n_paths,
             "simulation_n_steps": simulation.diagnostics.get("n_steps"),
@@ -232,7 +238,6 @@ class RealTimeMispricingDetector:
             if outcome_name == "up"
             else pricing["expected_fair_down_price"]
         )
-        risk_score = pricing["risk_score_up"] if outcome_name == "up" else pricing["risk_score_down"]
 
         best_bid = self._to_float(row.get("best_bid"))
         best_ask = self._to_float(row.get("best_ask"))
@@ -242,7 +247,6 @@ class RealTimeMispricingDetector:
         buy_signal = bool(
             buy_edge is not None
             and buy_edge > self.config.edge_threshold
-            and risk_score < self.config.max_allowed_risk
         )
 
         return {
@@ -254,10 +258,8 @@ class RealTimeMispricingDetector:
             "buy_edge": buy_edge,
             "hold_edge": hold_edge,
             "sell_edge": sell_edge,
-            "risk_score": risk_score,
             "buy_signal": buy_signal,
             "edge_threshold": self.config.edge_threshold,
-            "max_allowed_risk": self.config.max_allowed_risk,
             **pricing,
         }
 
@@ -450,29 +452,6 @@ class RealTimeMispricingDetector:
         if _tqdm is not None:
             return _tqdm(items, total=len(items), desc=description)
         return RealTimeMispricingDetector._simple_progress(items, description=description)
-
-    def _estimated_batch_rollout_steps(self, rows: List[Dict[str, Any]]) -> int:
-        if not rows:
-            return 0
-        if self.config.rollout_horizon_seconds > 0.0:
-            step_seconds = float(self.config.rollout_horizon_seconds)
-        else:
-            step_seconds = float(self.config.simulation_dt_seconds)
-
-        if step_seconds <= 0.0:
-            return len(rows)
-
-        seconds_to_end = [
-            self._to_float(row.get("seconds_to_end"))
-            for row in rows
-        ]
-        valid_seconds = np.asarray(
-            [value for value in seconds_to_end if value is not None and np.isfinite(value) and value > 0.0],
-            dtype=float,
-        )
-        if valid_seconds.size == 0:
-            return len(rows)
-        return int(np.ceil(valid_seconds / step_seconds).sum())
 
     @staticmethod
     def _progress_manager(*, total: int, description: str, enabled: bool):

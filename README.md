@@ -259,7 +259,6 @@ The replay output includes:
 - `buy_edge`
 - `hold_edge`
 - `sell_edge`
-- `risk_score`
 - `simulation_mode = spot_terminal_binary_payoff_rollout`
 - `rollout_kernel = spot_jump_diffusion`
 

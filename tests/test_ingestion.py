@@ -1,29 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from polymarket_quant.ingestion.client import BasePolymarketClient
 from polymarket_quant.ingestion.pipeline import IngestionPipeline
-from scripts.backfill_resolutions import _load_event_slugs
-from pathlib import Path
-import json
 
 
 def _utc_iso(dt):
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 class MockPolymarketClient(BasePolymarketClient):
-    def fetch_active_markets(self, limit=100):
-        return [{
-            "id": "mkt_123",
-            "condition_id": "cond_456",
-            "question": "Will ETH reach $4000 by End of Year?",
-            "category": "Crypto",
-            "endDate": "2024-12-31T23:59:59Z",
-            "active": True,
-            "tokens": [
-                {"token_id": "tok_y", "outcome": "Yes"},
-                {"token_id": "tok_n", "outcome": "No"}
-            ]
-        }]
-
     def fetch_orderbook(self, token_id):
         return {
             "market": "cond_456",
@@ -64,9 +47,6 @@ class MockPolymarketClient(BasePolymarketClient):
                 "clobTokenIds": '["tok_up", "tok_down"]',
             }],
         }
-
-    def fetch_price_history(self, token_id, interval="max", fidelity=1):
-        return {"history": [{"t": 1767225600, "p": 0.51}, {"t": 1767225660, "p": 0.55}]}
 
 
 class OpenMarketMockPolymarketClient(MockPolymarketClient):
@@ -126,130 +106,19 @@ class OpenMarketMockPolymarketClient(MockPolymarketClient):
         }
 
 
-class ClosedMarketMockPolymarketClient(MockPolymarketClient):
+class CountingOpenMarketMockPolymarketClient(OpenMarketMockPolymarketClient):
+    def __init__(self):
+        self.series_calls = 0
+        self.event_calls = 0
+
     def fetch_series(self, slug):
-        event_prefix = "btc-updown-5m" if slug.startswith("btc") else "eth-updown-5m"
-        return [{
-            "slug": slug,
-            "events": [
-                {
-                    "id": "event_wrong_prefix",
-                    "slug": "xrp-updown-5m-closed-event",
-                    "title": "XRP Up or Down - Closed Test",
-                    "startTime": "2026-01-01T00:00:00Z",
-                    "endDate": "2026-01-01T00:05:00Z",
-                    "closed": True,
-                },
-                {
-                    "id": "event_closed",
-                    "slug": f"{event_prefix}-closed-event",
-                    "title": "Bitcoin Up or Down - Closed Test",
-                    "startTime": "2026-01-01T00:00:00Z",
-                    "endDate": "2026-01-01T00:05:00Z",
-                    "closed": True,
-                },
-            ]
-        }]
+        self.series_calls += 1
+        return super().fetch_series(slug)
 
     def fetch_event_by_slug(self, slug):
-        return {
-            "id": "event_closed",
-            "slug": slug,
-            "title": "Bitcoin Up or Down - Closed Test",
-            "startTime": "2026-01-01T00:00:00Z",
-            "endDate": "2026-01-01T00:05:00Z",
-            "closed": True,
-            "markets": [{
-                "id": "mkt_closed",
-                "conditionId": "cond_closed",
-                "outcomes": '["Up", "Down"]',
-                "outcomePrices": '["0", "1"]',
-                "eventStartTime": "2026-01-01T00:00:00Z",
-                "endDate": "2026-01-01T00:05:00Z",
-                "closed": True,
-                "clobTokenIds": '["tok_up", "tok_down"]',
-            }],
-        }
+        self.event_calls += 1
+        return super().fetch_event_by_slug(slug)
 
-
-def test_pipeline_normalization(tmp_path):
-    raw_dir = tmp_path / "raw"
-    processed_dir = tmp_path / "processed"
-    
-    client = MockPolymarketClient()
-    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
-    
-    pipeline.run_market_metadata_ingestion()
-    
-    # Assert raw file exists
-    raw_files = [path for path in raw_dir.glob("markets_raw_*.json") if "latest" not in path.name]
-    assert len(raw_files) == 1
-    assert (raw_dir / "markets_raw_latest.json").exists()
-    
-    # Assert processed Parquet exists
-    processed_files = [path for path in processed_dir.glob("markets_normalized_*.parquet") if "latest" not in path.name]
-    assert len(processed_files) == 1
-    assert (processed_dir / "markets_normalized_latest.parquet").exists()
-    
-    import pandas as pd
-    df = pd.read_parquet(processed_files[0])
-    
-    assert len(df) == 1
-    assert df.iloc[0]["market_id"] == "mkt_123"
-    assert df.iloc[0]["category"] == "Crypto"
-    assert "time_to_resolution_seconds" in df.columns
-
-
-def test_orderbook_snapshot_pipeline(tmp_path):
-    raw_dir = tmp_path / "raw"
-    processed_dir = tmp_path / "processed"
-
-    client = MockPolymarketClient()
-    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
-
-    pipeline.run_orderbook_snapshot_ingestion()
-
-    raw_files = [path for path in raw_dir.glob("orderbooks_raw_*.json") if "latest" not in path.name]
-    assert len(raw_files) == 1
-    assert (raw_dir / "orderbooks_raw_latest.json").exists()
-
-    processed_files = [path for path in processed_dir.glob("orderbooks_snapshot_*.parquet") if "latest" not in path.name]
-    assert len(processed_files) == 1
-    assert (processed_dir / "orderbooks_snapshot_latest.parquet").exists()
-
-    import pandas as pd
-    df = pd.read_parquet(processed_files[0])
-
-    assert len(df) == 2
-    assert set(df["outcome_name"]) == {"Yes", "No"}
-    assert df.iloc[0]["best_bid"] == 0.45
-    assert df.iloc[0]["best_ask"] == 0.48
-
-
-def test_crypto_5m_history_pipeline(tmp_path):
-    raw_dir = tmp_path / "raw"
-    processed_dir = tmp_path / "processed"
-
-    client = MockPolymarketClient()
-    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
-
-    pipeline.run_crypto_5m_history_ingestion(series_slugs=["btc-up-or-down-5m"], event_limit=1)
-
-    raw_files = [path for path in raw_dir.glob("crypto_5m_history_raw_*.json") if "latest" not in path.name]
-    assert len(raw_files) == 1
-    assert (raw_dir / "crypto_5m_history_raw_latest.json").exists()
-
-    processed_files = [path for path in processed_dir.glob("crypto_5m_price_history_*.parquet") if "latest" not in path.name]
-    assert len(processed_files) == 1
-    assert (processed_dir / "crypto_5m_price_history_latest.parquet").exists()
-
-    import pandas as pd
-    df = pd.read_parquet(processed_files[0])
-
-    assert len(df) == 4
-    assert set(df["outcome_name"]) == {"Up", "Down"}
-    assert set(df["is_winner"]) == {0, 1}
-    assert set(df["asset"]) == {"BTC"}
 
 
 def test_live_crypto_5m_orderbook_collection(tmp_path):
@@ -280,77 +149,52 @@ def test_live_crypto_5m_orderbook_collection(tmp_path):
         run_timestamp="test",
     )
 
-    assert (raw_dir / "crypto_5m_orderbooks_raw_test.json").exists()
-    assert (processed_dir / "crypto_5m_orderbook_levels_test.parquet").exists()
-    assert (processed_dir / "crypto_5m_orderbook_summary_test.parquet").exists()
+    assert (tmp_path / "BTC" / "raw" / "polymarket" / "crypto_5m_orderbooks_raw_test.json").exists()
+    assert (tmp_path / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_levels_test.parquet").exists()
+    assert (tmp_path / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_summary_test.parquet").exists()
 
 
-def test_crypto_5m_resolution_backfill_for_event_slugs(tmp_path):
+def test_live_collection_with_explicit_event_slugs_skips_series_fetch(tmp_path):
     raw_dir = tmp_path / "raw"
     processed_dir = tmp_path / "processed"
 
-    client = ClosedMarketMockPolymarketClient()
+    client = CountingOpenMarketMockPolymarketClient()
     pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
 
-    raw_records, resolution_rows = pipeline.collect_crypto_5m_resolutions_for_event_slugs(
-        event_slugs=["btc-updown-5m-closed-event", "xrp-updown-5m-closed-event"],
-        event_slug_prefixes=["btc-updown-5m"],
-    )
-
-    assert len(raw_records) == 1
-    assert len(resolution_rows) == 2
-    assert raw_records[0]["series_slug"] == "btc-up-or-down-5m"
-    assert {row["outcome_name"] for row in resolution_rows} == {"Up", "Down"}
-    assert {row["is_winner"] for row in resolution_rows} == {0, 1}
-    assert all(row["event_slug"].startswith("btc-updown-5m") for row in resolution_rows)
-
-    pipeline.save_crypto_5m_resolutions(
-        raw_records=raw_records,
-        resolution_rows=resolution_rows,
-        run_timestamp="test",
-    )
-
-    assert (raw_dir / "crypto_5m_resolutions_raw_test.json").exists()
-    assert (processed_dir / "crypto_5m_resolutions_test.parquet").exists()
-    assert (processed_dir / "crypto_5m_resolutions_latest.parquet").exists()
-
-
-def test_backfill_loads_event_slugs_from_orderbook_files(tmp_path):
-    import pandas as pd
-
-    path = tmp_path / "crypto_5m_orderbook_summary_test.parquet"
-    pd.DataFrame(
-        {
-            "event_slug": [
-                "btc-updown-5m-1",
-                "btc-updown-5m-1",
-                "eth-updown-5m-1",
-                "xrp-updown-5m-1",
-            ]
-        }
-    ).to_parquet(path, index=False)
-
-    event_slugs = _load_event_slugs(
-        input_glob=str(tmp_path / "crypto_5m_orderbook_summary_*.parquet"),
+    pipeline.collect_crypto_5m_orderbooks_once(
+        series_slugs=["btc-up-or-down-5m", "eth-up-or-down-5m"],
+        event_limit=2,
         event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
-        now=datetime.fromtimestamp(1_000, tz=timezone.utc),
+        event_slugs=["btc-updown-5m-open-event", "eth-updown-5m-open-event"],
     )
 
-    assert event_slugs == ["btc-updown-5m-1", "eth-updown-5m-1"]
+    assert client.series_calls == 0
+    assert client.event_calls == 2
 
 
-def test_backfill_skips_slugs_that_are_not_ready_for_resolution(tmp_path):
-    import pandas as pd
+def test_live_collection_reuses_event_detail_cache(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
 
-    path = tmp_path / "crypto_5m_orderbook_summary_test.parquet"
-    pd.DataFrame({"event_slug": ["btc-updown-5m-1000", "btc-updown-5m-2000"]}).to_parquet(path, index=False)
+    client = CountingOpenMarketMockPolymarketClient()
+    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
+    event_cache = {}
 
-    event_slugs = _load_event_slugs(
-        input_glob=str(tmp_path / "crypto_5m_orderbook_summary_*.parquet"),
-        event_slug_prefixes=["btc-updown-5m"],
-        event_duration_seconds=300,
-        settlement_delay_seconds=60,
-        now=datetime.fromtimestamp(2300, tz=timezone.utc),
+    pipeline.collect_crypto_5m_orderbooks_once(
+        series_slugs=["btc-up-or-down-5m", "eth-up-or-down-5m"],
+        event_limit=2,
+        event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
+        event_slugs=["btc-updown-5m-open-event", "eth-updown-5m-open-event"],
+        event_details_by_slug=event_cache,
+    )
+    pipeline.collect_crypto_5m_orderbooks_once(
+        series_slugs=["btc-up-or-down-5m", "eth-up-or-down-5m"],
+        event_limit=2,
+        event_slug_prefixes=["btc-updown-5m", "eth-updown-5m"],
+        event_slugs=["btc-updown-5m-open-event", "eth-updown-5m-open-event"],
+        event_details_by_slug=event_cache,
     )
 
-    assert event_slugs == ["btc-updown-5m-1000"]
+    assert client.series_calls == 0
+    assert client.event_calls == 2
+    assert set(event_cache) == {"btc-updown-5m-open-event", "eth-updown-5m-open-event"}

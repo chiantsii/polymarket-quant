@@ -8,11 +8,11 @@ data:
 api:
   gamma_url: "https://gamma-api.polymarket.com"
   clob_url: "https://clob.polymarket.com"
-  coinbase_url: "https://api.exchange.coinbase.com"
+  binance_url: "https://api.binance.com"
 
 spot:
   products:
-    BTC: "BTC-USD"
-    ETH: "ETH-USD"
+    BTC: "BTCUSDT"
+    ETH: "ETHUSDT"
 
 # Backtest & Risk settings omitted for brevity...

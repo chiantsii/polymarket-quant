@@ -54,6 +54,7 @@ class TransitionModelConfig:
     jump_learning_rate: float = 0.05
     jump_std_multiplier: float = 2.5
     jump_abs_latent_logit_threshold: float = 0.12
+    jump_abs_log_spot_threshold: float = 0.0025
     diffusion_oof_folds: int = 5
     diffusion_variance_floor: float = 5e-4
     diffusion_variance_cap: float = 5e-2
@@ -89,6 +90,11 @@ class TransitionModelBundle:
     latent_sigma_model: HistGradientBoostingRegressor | None
     latent_jump_mean_model: HistGradientBoostingRegressor | None
     latent_jump_std_model: HistGradientBoostingRegressor | None
+    spot_mu_model: HistGradientBoostingRegressor | None
+    spot_sigma_model: HistGradientBoostingRegressor | None
+    spot_jump_model: HistGradientBoostingClassifier | DummyClassifier | None
+    spot_jump_mean_model: HistGradientBoostingRegressor | None
+    spot_jump_std_model: HistGradientBoostingRegressor | None
     default_step_seconds: float
     jump_label_column: str = "jump_event"
 
@@ -229,6 +235,71 @@ class TransitionModelBundle:
         predictions["jump_intensity_hat"] = predictions["jump_probability_hat_latent_logit_probability"]
         return predictions
 
+    def predict_spot_kernel(self, transition_targets: pd.DataFrame) -> pd.DataFrame:
+        """Predict a state-conditioned log-spot jump-diffusion kernel."""
+
+        if transition_targets.empty:
+            return transition_targets.copy()
+
+        mu_model = getattr(self, "spot_mu_model", None)
+        sigma_model = getattr(self, "spot_sigma_model", None)
+        jump_model = getattr(self, "spot_jump_model", None)
+        if mu_model is None or sigma_model is None or jump_model is None:
+            raise ValueError("Transition bundle does not contain parametric spot kernel models")
+
+        predictions = transition_targets.copy()
+        X = _feature_frame(predictions, self.feature_columns)
+        dt = _prediction_step_seconds(predictions)
+
+        mu_hat = pd.Series(mu_model.predict(X), index=predictions.index, dtype=float)
+        log_sigma_sq_hat = pd.Series(sigma_model.predict(X), index=predictions.index, dtype=float)
+        sigma_sq_hat = _clip_diffusion_variance(np.exp(log_sigma_sq_hat).astype(float), self.config)
+        sigma_hat = np.sqrt(sigma_sq_hat)
+
+        if hasattr(jump_model, "predict_proba"):
+            jump_probs = jump_model.predict_proba(X)
+            if jump_probs.ndim == 2 and jump_probs.shape[1] >= 2:
+                jump_probability = np.asarray(jump_probs[:, 1], dtype=float)
+            else:
+                jump_probability = np.asarray(jump_probs[:, 0], dtype=float)
+        else:
+            jump_probability = np.asarray(jump_model.predict(X), dtype=float)
+        jump_probability = np.clip(jump_probability, 0.0, 1.0)
+        lambda_hat = _poisson_intensity_from_step_probability(jump_probability, dt.to_numpy(dtype=float))
+
+        jump_mean_model = getattr(self, "spot_jump_mean_model", None)
+        jump_std_model = getattr(self, "spot_jump_std_model", None)
+        if jump_mean_model is not None:
+            jump_mean_hat = pd.Series(jump_mean_model.predict(X), index=predictions.index, dtype=float)
+        else:
+            jump_mean_hat = pd.Series(0.0, index=predictions.index, dtype=float)
+
+        if jump_std_model is not None:
+            log_jump_var_hat = pd.Series(jump_std_model.predict(X), index=predictions.index, dtype=float)
+            jump_var_hat = _clip_diffusion_variance(np.exp(log_jump_var_hat).astype(float), self.config)
+            jump_std_hat = pd.Series(np.sqrt(jump_var_hat), index=predictions.index, dtype=float)
+        else:
+            jump_std_hat = pd.Series(0.0, index=predictions.index, dtype=float)
+
+        predictions["mu_hat_log_spot_ratio"] = mu_hat
+        predictions["sigma_hat_log_spot_ratio"] = sigma_hat
+        predictions["lambda_hat_log_spot_ratio"] = lambda_hat
+        predictions["jump_mean_hat_log_spot_ratio"] = jump_mean_hat
+        predictions["jump_std_hat_log_spot_ratio"] = jump_std_hat
+        predictions["jump_probability_hat_log_spot_ratio"] = jump_probability
+        return predictions
+
+    def predict_spot_kernel_from_event_state(self, event_state_row: dict[str, Any]) -> dict[str, float]:
+        """Project a serialized event-state row into spot-kernel parameters."""
+
+        feature_row = _event_state_to_transition_feature_row(
+            event_state_row,
+            feature_columns=self.feature_columns,
+            target_horizon_seconds=self.default_step_seconds,
+        )
+        predictions = self.predict_spot_kernel(pd.DataFrame([feature_row]))
+        return predictions.iloc[0].to_dict()
+
     def _postprocess_future_state(self, predictions: pd.DataFrame) -> None:
         regime_columns = [
             "regime_normal_posterior",
@@ -294,6 +365,11 @@ def fit_transition_model(
     latent_sigma_model: HistGradientBoostingRegressor | None = None
     latent_jump_mean_model: HistGradientBoostingRegressor | None = None
     latent_jump_std_model: HistGradientBoostingRegressor | None = None
+    spot_mu_model: HistGradientBoostingRegressor | None = None
+    spot_sigma_model: HistGradientBoostingRegressor | None = None
+    spot_jump_model: HistGradientBoostingClassifier | DummyClassifier | None = None
+    spot_jump_mean_model: HistGradientBoostingRegressor | None = None
+    spot_jump_std_model: HistGradientBoostingRegressor | None = None
 
     for target_column in primitive_target_columns:
         delta_column = f"target_delta_{target_column}"
@@ -497,6 +573,102 @@ def fit_transition_model(
         latent_dt.to_numpy(dtype=float),
     )
 
+    spot_kernel = _build_spot_kernel_training_targets(training_rows)
+    spot_mu_model: HistGradientBoostingRegressor | None
+    spot_sigma_model: HistGradientBoostingRegressor | None
+    spot_jump_model: HistGradientBoostingClassifier | DummyClassifier | None
+    spot_jump_mean_model: HistGradientBoostingRegressor | None
+    spot_jump_std_model: HistGradientBoostingRegressor | None
+    spot_rate = spot_kernel["delta"] / spot_kernel["dt"]
+    if int(spot_kernel["valid"].sum()) >= int(config.min_training_rows):
+        spot_mu_model = HistGradientBoostingRegressor(
+            max_iter=config.drift_max_iter,
+            max_depth=config.drift_max_depth,
+            learning_rate=config.drift_learning_rate,
+            random_state=config.random_state,
+        )
+        spot_mu_model.fit(X.loc[spot_kernel["valid"]], spot_rate)
+        spot_mu_oof = _out_of_fold_drift_predictions(
+            drift_model=spot_mu_model,
+            X=X.loc[spot_kernel["valid"]],
+            y=spot_rate,
+            config=config,
+        )
+        spot_residual = spot_kernel["delta"] - (spot_mu_oof * spot_kernel["dt"])
+        spot_sigma_sq = np.clip(
+            np.square(spot_residual) / spot_kernel["dt"],
+            config.diffusion_variance_floor,
+            config.diffusion_variance_cap,
+        )
+        spot_sigma_model = HistGradientBoostingRegressor(
+            max_iter=config.diffusion_max_iter,
+            max_depth=config.diffusion_max_depth,
+            learning_rate=config.diffusion_learning_rate,
+            random_state=config.random_state,
+        )
+        spot_sigma_model.fit(X.loc[spot_kernel["valid"]], np.log(spot_sigma_sq))
+
+        spot_jump_labels = _build_spot_jump_event_labels(training_rows, spot_kernel, config)
+        spot_jump_y = spot_jump_labels.loc[spot_kernel["valid"]].astype(int)
+        if spot_jump_y.nunique() <= 1:
+            spot_jump_model = DummyClassifier(strategy="most_frequent")
+            spot_jump_model.fit(X.loc[spot_kernel["valid"]], spot_jump_y)
+        else:
+            spot_jump_model = HistGradientBoostingClassifier(
+                max_iter=config.jump_max_iter,
+                max_depth=config.jump_max_depth,
+                learning_rate=config.jump_learning_rate,
+                random_state=config.random_state,
+            )
+            spot_jump_model.fit(X.loc[spot_kernel["valid"]], spot_jump_y)
+
+        spot_jump_valid = spot_kernel["valid"] & spot_jump_labels.fillna(0).astype(bool)
+        if int(spot_jump_valid.sum()) >= int(config.parametric_min_jump_rows):
+            spot_jump_delta = spot_kernel["delta"].loc[spot_jump_valid]
+            spot_jump_dt = spot_kernel["dt"].loc[spot_jump_valid]
+            spot_jump_mu = pd.Series(
+                spot_mu_model.predict(X.loc[spot_jump_valid]),
+                index=spot_jump_delta.index,
+                dtype=float,
+            )
+            spot_jump_excess = spot_jump_delta - (spot_jump_mu * spot_jump_dt)
+
+            spot_jump_mean_model = HistGradientBoostingRegressor(
+                max_iter=config.drift_max_iter,
+                max_depth=config.drift_max_depth,
+                learning_rate=config.drift_learning_rate,
+                random_state=config.random_state,
+            )
+            spot_jump_mean_model.fit(X.loc[spot_jump_valid], spot_jump_excess)
+            spot_jump_mean_oof = _out_of_fold_drift_predictions(
+                drift_model=spot_jump_mean_model,
+                X=X.loc[spot_jump_valid],
+                y=spot_jump_excess,
+                config=config,
+            )
+            spot_jump_residual = spot_jump_excess - spot_jump_mean_oof
+            spot_jump_var = np.clip(
+                np.square(spot_jump_residual),
+                config.diffusion_variance_floor,
+                config.diffusion_variance_cap,
+            )
+            spot_jump_std_model = HistGradientBoostingRegressor(
+                max_iter=config.diffusion_max_iter,
+                max_depth=config.diffusion_max_depth,
+                learning_rate=config.diffusion_learning_rate,
+                random_state=config.random_state,
+            )
+            spot_jump_std_model.fit(X.loc[spot_jump_valid], np.log(spot_jump_var))
+        else:
+            spot_jump_mean_model = None
+            spot_jump_std_model = None
+    else:
+        spot_mu_model = None
+        spot_sigma_model = None
+        spot_jump_model = None
+        spot_jump_mean_model = None
+        spot_jump_std_model = None
+
     bundle = TransitionModelBundle(
         config=config,
         feature_columns=feature_columns,
@@ -512,6 +684,11 @@ def fit_transition_model(
         latent_sigma_model=latent_sigma_model,
         latent_jump_mean_model=latent_jump_mean_model,
         latent_jump_std_model=latent_jump_std_model,
+        spot_mu_model=spot_mu_model,
+        spot_sigma_model=spot_sigma_model,
+        spot_jump_model=spot_jump_model,
+        spot_jump_mean_model=spot_jump_mean_model,
+        spot_jump_std_model=spot_jump_std_model,
         default_step_seconds=_default_step_seconds(training_rows),
     )
     predictions = bundle.predict(transition_targets)
@@ -532,6 +709,20 @@ def fit_transition_model(
     for column in latent_kernel_columns:
         if column in latent_kernel_predictions.columns:
             predictions[column] = latent_kernel_predictions[column]
+
+    if spot_mu_model is not None and spot_sigma_model is not None and spot_jump_model is not None:
+        spot_kernel_predictions = bundle.predict_spot_kernel(transition_targets)
+        spot_kernel_columns = (
+            "mu_hat_log_spot_ratio",
+            "sigma_hat_log_spot_ratio",
+            "lambda_hat_log_spot_ratio",
+            "jump_mean_hat_log_spot_ratio",
+            "jump_std_hat_log_spot_ratio",
+            "jump_probability_hat_log_spot_ratio",
+        )
+        for column in spot_kernel_columns:
+            if column in spot_kernel_predictions.columns:
+                predictions[column] = spot_kernel_predictions[column]
 
     summary = {
         "training_rows": int(len(training_rows)),
@@ -558,6 +749,21 @@ def fit_transition_model(
             "mu_rate_rmse": float(mean_squared_error(latent_rate, latent_mu_oof) ** 0.5),
             "sigma_mean": float(np.mean(latent_sigma_hat)),
             "lambda_mean": float(np.mean(latent_lambda_hat)),
+        },
+        "parametric_spot_kernel": {
+            "target": "log_spot_ratio",
+            "kernel_columns": [
+                "mu_hat_log_spot_ratio",
+                "sigma_hat_log_spot_ratio",
+                "lambda_hat_log_spot_ratio",
+                "jump_mean_hat_log_spot_ratio",
+                "jump_std_hat_log_spot_ratio",
+                "jump_probability_hat_log_spot_ratio",
+            ],
+            "step_seconds_median": float(spot_kernel["dt"].median()) if len(spot_kernel["dt"]) else float("nan"),
+            "rows": int(spot_kernel["valid"].sum()),
+            "has_models": bool(spot_mu_model is not None and spot_sigma_model is not None and spot_jump_model is not None),
+            "has_jump_size_models": bool(spot_jump_mean_model is not None and spot_jump_std_model is not None),
         },
         "target_metrics": target_summaries,
     }
@@ -723,3 +929,68 @@ def _default_step_seconds(rows: pd.DataFrame) -> float:
     if len(target_horizon):
         return float(target_horizon.median())
     return 1.0
+
+
+def _build_spot_kernel_training_targets(rows: pd.DataFrame) -> dict[str, pd.Series]:
+    current_return = pd.to_numeric(rows.get("current_spot_return_since_reference"), errors="coerce")
+    future_return = pd.to_numeric(rows.get("future_spot_return_since_reference"), errors="coerce")
+    dt = _training_step_seconds(rows)
+
+    valid = (
+        current_return.notna()
+        & future_return.notna()
+        & (current_return > -1.0)
+        & (future_return > -1.0)
+        & dt.notna()
+        & (dt > 0.0)
+    )
+    current_log_ratio = pd.Series(np.nan, index=rows.index, dtype=float)
+    future_log_ratio = pd.Series(np.nan, index=rows.index, dtype=float)
+    current_log_ratio.loc[valid] = np.log1p(current_return.loc[valid])
+    future_log_ratio.loc[valid] = np.log1p(future_return.loc[valid])
+    delta = future_log_ratio - current_log_ratio
+    return {
+        "valid": valid,
+        "current": current_log_ratio.loc[valid],
+        "future": future_log_ratio.loc[valid],
+        "delta": delta.loc[valid],
+        "dt": dt.loc[valid],
+    }
+
+
+def _build_spot_jump_event_labels(
+    rows: pd.DataFrame,
+    spot_kernel: dict[str, pd.Series],
+    config: TransitionModelConfig,
+) -> pd.Series:
+    jump_event = pd.Series(np.nan, index=rows.index, dtype=float)
+    if not len(spot_kernel["delta"]):
+        return jump_event
+
+    current_vol = pd.to_numeric(rows.get("current_volatility_per_sqrt_second"), errors="coerce").loc[spot_kernel["valid"]]
+    expected_step_std = current_vol.clip(lower=0.0) * np.sqrt(spot_kernel["dt"])
+    jump_threshold = np.maximum(
+        float(config.jump_abs_log_spot_threshold),
+        float(config.jump_std_multiplier) * expected_step_std.fillna(0.0),
+    )
+    jump_event.loc[spot_kernel["valid"]] = (spot_kernel["delta"].abs() > jump_threshold).astype(float)
+    return jump_event
+
+
+def _event_state_to_transition_feature_row(
+    event_state_row: dict[str, Any],
+    *,
+    feature_columns: tuple[str, ...],
+    target_horizon_seconds: float,
+) -> dict[str, Any]:
+    feature_row: dict[str, Any] = {}
+    for column in feature_columns:
+        if column == "target_horizon_seconds":
+            feature_row[column] = target_horizon_seconds
+            continue
+        if column.startswith("current_"):
+            source_column = column.removeprefix("current_")
+            feature_row[column] = event_state_row.get(source_column)
+            continue
+        feature_row[column] = event_state_row.get(column)
+    return feature_row

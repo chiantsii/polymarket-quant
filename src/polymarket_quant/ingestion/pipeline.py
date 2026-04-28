@@ -16,7 +16,8 @@ class IngestionPipeline:
         self.client = client
         self.raw_dir = Path(raw_dir)
         self.processed_dir = Path(processed_dir)
-        
+        self.asset_root_dir = self.raw_dir.parent
+
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -26,6 +27,7 @@ class IngestionPipeline:
         event_limit: int = 1,
         event_slug_prefixes: Optional[List[str]] = None,
         event_slugs: Optional[List[str]] = None,
+        event_details_by_slug: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Collect one live orderbook snapshot batch for BTC/ETH Up or Down 5m markets."""
         collected_at = datetime.now(timezone.utc).isoformat()
@@ -52,7 +54,14 @@ class IngestionPipeline:
                 )
             open_events = [event for event in events if event.get("closed") is not True]
             for event in open_events:
-                event_detail = self.client.fetch_event_by_slug(event["slug"])
+                event_slug = event["slug"]
+                event_detail = None
+                if event_details_by_slug is not None:
+                    event_detail = event_details_by_slug.get(event_slug)
+                if event_detail is None:
+                    event_detail = self.client.fetch_event_by_slug(event_slug)
+                    if event_detail and event_details_by_slug is not None:
+                        event_details_by_slug[event_slug] = event_detail
                 if not event_detail:
                     continue
 
@@ -112,27 +121,51 @@ class IngestionPipeline:
             return
 
         run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        raw_path = self.raw_dir / f"crypto_5m_orderbooks_raw_{run_timestamp}.json"
-        self._write_json(raw_path, raw_snapshots)
-        self._write_json(self.raw_dir / "crypto_5m_orderbooks_raw_latest.json", raw_snapshots)
+        grouped_raw = self._group_rows_by_asset(raw_snapshots)
+        grouped_levels = self._group_rows_by_asset(level_rows)
+        grouped_summary = self._group_rows_by_asset(summary_rows)
 
-        levels_path = self.processed_dir / f"crypto_5m_orderbook_levels_{run_timestamp}.parquet"
-        levels_df = pd.DataFrame(level_rows)
-        levels_df.to_parquet(levels_path, index=False)
-        levels_df.to_parquet(self.processed_dir / "crypto_5m_orderbook_levels_latest.parquet", index=False)
+        for asset, asset_raw_snapshots in grouped_raw.items():
+            raw_dir, processed_dir = self._asset_storage_dirs(asset)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            processed_dir.mkdir(parents=True, exist_ok=True)
 
-        summary_path = self.processed_dir / f"crypto_5m_orderbook_summary_{run_timestamp}.parquet"
-        summary_df = pd.DataFrame(summary_rows)
-        summary_df.to_parquet(summary_path, index=False)
-        summary_df.to_parquet(self.processed_dir / "crypto_5m_orderbook_summary_latest.parquet", index=False)
+            raw_path = raw_dir / f"crypto_5m_orderbooks_raw_{run_timestamp}.json"
+            self._write_json(raw_path, asset_raw_snapshots)
+            self._write_json(raw_dir / "crypto_5m_orderbooks_raw_latest.json", asset_raw_snapshots)
 
-        logger.info(f"Saved {len(raw_snapshots)} raw crypto 5m orderbooks to {raw_path}")
-        logger.info(f"Saved {len(levels_df)} orderbook level rows to {levels_path}")
-        logger.info(f"Saved {len(summary_df)} orderbook summary rows to {summary_path}")
+            asset_level_rows = grouped_levels.get(asset, [])
+            levels_df = pd.DataFrame(asset_level_rows)
+            levels_path = processed_dir / f"crypto_5m_orderbook_levels_{run_timestamp}.parquet"
+            levels_df.to_parquet(levels_path, index=False)
+            levels_df.to_parquet(processed_dir / "crypto_5m_orderbook_levels_latest.parquet", index=False)
+
+            asset_summary_rows = grouped_summary.get(asset, [])
+            summary_df = pd.DataFrame(asset_summary_rows)
+            summary_path = processed_dir / f"crypto_5m_orderbook_summary_{run_timestamp}.parquet"
+            summary_df.to_parquet(summary_path, index=False)
+            summary_df.to_parquet(processed_dir / "crypto_5m_orderbook_summary_latest.parquet", index=False)
+
+            logger.info(f"Saved {len(asset_raw_snapshots)} raw crypto 5m {asset} orderbooks to {raw_path}")
+            logger.info(f"Saved {len(levels_df)} {asset} orderbook level rows to {levels_path}")
+            logger.info(f"Saved {len(summary_df)} {asset} orderbook summary rows to {summary_path}")
 
     def _write_json(self, path: Path, payload: Any) -> None:
         with open(path, "w") as f:
             json.dump(payload, f)
+
+    def _group_rows_by_asset(self, rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            asset = str(row.get("asset", "")).upper()
+            if not asset:
+                continue
+            grouped.setdefault(asset, []).append(row)
+        return grouped
+
+    def _asset_storage_dirs(self, asset: str) -> tuple[Path, Path]:
+        asset_root = self.asset_root_dir / str(asset).upper()
+        return asset_root / "raw" / "polymarket", asset_root / "processed" / "polymarket"
 
     def _extract_contracts(self, raw_market: Dict[str, Any]) -> List[Dict[str, str]]:
         tokens = raw_market.get("tokens") or []

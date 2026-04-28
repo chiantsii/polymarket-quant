@@ -7,14 +7,19 @@ from polymarket_quant.state import (
     LatentMarkovStateConfig,
     build_market_state_dataset,
 )
-from polymarket_quant.state.dataset import load_optional_parquet_glob, load_parquet_glob
+from polymarket_quant.state.dataset import (
+    filter_complete_event_windows,
+    load_optional_parquet_glob,
+    load_parquet_glob,
+)
 from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_ORDERBOOK_GLOB = "data/processed/crypto_5m_orderbook_summary_*.parquet"
-DEFAULT_ORDERBOOK_LEVELS_GLOB = "data/processed/crypto_5m_orderbook_levels_*.parquet"
-DEFAULT_SPOT_GLOB = "data/processed/crypto_spot_ticks_*.parquet"
+DEFAULT_ORDERBOOK_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_summary_*.parquet"
+DEFAULT_ORDERBOOK_LEVELS_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_levels_*.parquet"
+DEFAULT_SPOT_GLOB = "data/*/processed/spot/binance_spot_ticks_*.parquet"
+WINDOW_COVERAGE_TOLERANCE_SECONDS = 10.0
 
 
 def _build_state_config(
@@ -56,6 +61,15 @@ def build_market_state(
     orderbooks = load_parquet_glob(orderbook_glob, include_latest=include_latest)
     orderbook_levels = load_optional_parquet_glob(orderbook_levels_glob, include_latest=include_latest)
     spot = load_parquet_glob(spot_glob, include_latest=include_latest)
+    orderbooks, spot, orderbook_levels = filter_complete_event_windows(
+        orderbooks=orderbooks,
+        spot=spot,
+        orderbook_levels=orderbook_levels,
+        event_duration_seconds=event_duration_seconds,
+        coverage_tolerance_seconds=WINDOW_COVERAGE_TOLERANCE_SECONDS,
+    )
+    if orderbooks.empty:
+        raise ValueError("No complete event windows remained after event_slug-based window reconstruction.")
 
     state_config = _build_state_config(
         event_duration_seconds=event_duration_seconds,

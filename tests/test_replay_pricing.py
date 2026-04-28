@@ -12,6 +12,22 @@ from polymarket_quant.state import (
 )
 
 
+class _StubTransitionBundle:
+    default_step_seconds = 15.0
+    spot_mu_model = object()
+    spot_sigma_model = object()
+    spot_jump_model = object()
+
+    def predict_spot_kernel_from_event_state(self, event_state_row):
+        return {
+            "mu_hat_log_spot_ratio": 0.0,
+            "sigma_hat_log_spot_ratio": float(event_state_row.get("volatility_per_sqrt_second", 0.0005)),
+            "lambda_hat_log_spot_ratio": 0.0,
+            "jump_mean_hat_log_spot_ratio": 0.0,
+            "jump_std_hat_log_spot_ratio": 0.0,
+        }
+
+
 def _orderbook_row(timestamp, event_slug: str, outcome_name: str, token_id: str, best_bid: float, best_ask: float):
     event_start = datetime.fromtimestamp(1775578800, tz=timezone.utc)
     event_end = event_start + timedelta(minutes=5)
@@ -49,8 +65,8 @@ def _orderbook_row(timestamp, event_slug: str, outcome_name: str, token_id: str,
 def _spot_row(timestamp, price: float):
     return {
         "asset": "BTC",
-        "product_id": "BTC-USD",
-        "source": "coinbase",
+        "product_id": "BTCUSDT",
+        "source": "binance_book_ticker",
         "collected_at": timestamp.isoformat(),
         "exchange_time": timestamp.isoformat(),
         "price": price,
@@ -112,6 +128,7 @@ def test_replay_pricing_generates_edge_rows(tmp_path):
         event_state_glob=str(input_dir / "crypto_5m_event_state_*.parquet"),
         output_dir=str(output_dir),
         n_samples=200,
+        transition_bundle=_StubTransitionBundle(),
         run_timestamp="test",
     )
 
@@ -139,6 +156,7 @@ def test_replay_pricing_keeps_spot_terminal_payoff_mode_with_step_override(tmp_p
         output_dir=str(output_dir),
         n_samples=128,
         rollout_horizon_seconds=15.0,
+        transition_bundle=_StubTransitionBundle(),
         run_timestamp="rollout_test",
     )
 

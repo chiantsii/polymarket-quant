@@ -107,26 +107,7 @@ DEFAULT_PRIMITIVE_TARGET_COLUMNS: tuple[str, ...] = (
 class TransitionTargetConfig:
     """Configuration for pairing current states with future transition targets."""
 
-    pairing_mode: str = "next"
-    horizons_seconds: tuple[float, ...] = (15.0,)
-    tolerance_seconds: float = 2.0
     include_unmatched: bool = False
-
-    def validated_horizons(self) -> tuple[float, ...]:
-        if self.validated_pairing_mode() != "horizon":
-            return ()
-        horizons = tuple(float(horizon) for horizon in self.horizons_seconds)
-        if not horizons:
-            raise ValueError("At least one horizon is required")
-        if any(horizon <= 0.0 for horizon in horizons):
-            raise ValueError("All horizons must be strictly positive")
-        return tuple(dict.fromkeys(horizons))
-
-    def validated_pairing_mode(self) -> str:
-        pairing_mode = str(self.pairing_mode).strip().lower()
-        if pairing_mode not in {"next", "horizon"}:
-            raise ValueError("pairing_mode must be either 'next' or 'horizon'")
-        return pairing_mode
 
 
 def build_transition_target_dataset(
@@ -145,8 +126,6 @@ def build_transition_target_dataset(
     """
 
     config = config or TransitionTargetConfig()
-    pairing_mode = config.validated_pairing_mode()
-    horizons = config.validated_horizons()
 
     required = {"event_slug", "collected_at"}
     missing = required - set(event_state.columns)
@@ -200,30 +179,15 @@ def build_transition_target_dataset(
         }
     )
 
-    frames: list[pd.DataFrame] = []
-    if pairing_mode == "next":
-        paired = _pair_current_and_next_state(
-            current_base=current_base,
-            future_base=future_base,
-        )
-        paired = _add_transition_deltas(paired, primitive_target_columns=available_primitive_targets)
-        if not config.include_unmatched:
-            paired = paired[paired["has_future_target"]].copy()
-        frames.append(paired)
-    else:
-        for horizon_seconds in horizons:
-            paired = _pair_current_and_future_states(
-                current_base=current_base,
-                future_base=future_base,
-                horizon_seconds=horizon_seconds,
-                tolerance_seconds=config.tolerance_seconds,
-            )
-            paired = _add_transition_deltas(paired, primitive_target_columns=available_primitive_targets)
-            if not config.include_unmatched:
-                paired = paired[paired["has_future_target"]].copy()
-            frames.append(paired)
+    paired = _pair_current_and_next_state(
+        current_base=current_base,
+        future_base=future_base,
+    )
+    paired = _add_transition_deltas(paired, primitive_target_columns=available_primitive_targets)
+    if not config.include_unmatched:
+        paired = paired[paired["has_future_target"]].copy()
 
-    transition_targets = pd.concat(frames, ignore_index=True)
+    transition_targets = paired
     transition_targets = transition_targets.sort_values(
         ["event_slug", "current_collected_at", "target_horizon_seconds"]
     ).reset_index(drop=True)
@@ -258,39 +222,6 @@ def build_transition_target_summary(transition_targets: pd.DataFrame) -> dict[st
     }
 
 
-def _pair_current_and_future_states(
-    *,
-    current_base: pd.DataFrame,
-    future_base: pd.DataFrame,
-    horizon_seconds: float,
-    tolerance_seconds: float,
-) -> pd.DataFrame:
-    current = current_base.copy()
-    current["target_horizon_seconds"] = float(horizon_seconds)
-    current["_target_state_dt"] = current["_current_state_dt"] + pd.to_timedelta(horizon_seconds, unit="s")
-
-    paired = pd.merge_asof(
-        current.sort_values(["_target_state_dt", "event_slug"]),
-        future_base.sort_values(["_future_state_dt", "event_slug"]),
-        by="event_slug",
-        left_on="_target_state_dt",
-        right_on="_future_state_dt",
-        direction="nearest",
-        tolerance=pd.Timedelta(seconds=tolerance_seconds),
-    ).sort_values(["event_slug", "_current_state_dt"]).reset_index(drop=True)
-
-    has_future = paired["future_collected_at"].notna() & (paired["_future_state_dt"] > paired["_current_state_dt"])
-    paired["has_future_target"] = has_future
-
-    realized_horizon_seconds = (
-        paired["_future_state_dt"] - paired["_current_state_dt"]
-    ).dt.total_seconds()
-    paired["realized_horizon_seconds"] = realized_horizon_seconds.where(has_future, np.nan)
-    paired["horizon_error_seconds"] = paired["realized_horizon_seconds"] - paired["target_horizon_seconds"]
-    paired["target_status"] = _target_status(paired, horizon_seconds)
-    return paired
-
-
 def _pair_current_and_next_state(
     *,
     current_base: pd.DataFrame,
@@ -321,22 +252,6 @@ def _pair_current_and_next_state(
     paired.loc[~has_future, "horizon_error_seconds"] = np.nan
     paired["target_status"] = _next_target_status(paired)
     return paired
-
-
-def _target_status(rows: pd.DataFrame, horizon_seconds: float) -> pd.Series:
-    status = pd.Series("missing_future_snapshot", index=rows.index, dtype=object)
-
-    matched = rows["has_future_target"].fillna(False)
-    status.loc[matched] = "matched"
-
-    nonfuture_match = rows["future_collected_at"].notna() & ~matched
-    status.loc[nonfuture_match] = "nonfuture_match"
-
-    current_seconds_to_end = pd.to_numeric(rows.get("current_seconds_to_end"), errors="coerce")
-    expired = current_seconds_to_end.notna() & (current_seconds_to_end < horizon_seconds)
-    status.loc[expired & ~matched] = "expired_before_horizon"
-    return status
-
 
 def _next_target_status(rows: pd.DataFrame) -> pd.Series:
     status = pd.Series("missing_future_snapshot", index=rows.index, dtype=object)

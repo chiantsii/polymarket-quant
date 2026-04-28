@@ -33,6 +33,27 @@ def next_window_start(now: datetime, event_duration_seconds: int) -> datetime:
     return datetime.fromtimestamp(next_epoch, tz=timezone.utc)
 
 
+def current_window_start(now: datetime, event_duration_seconds: int) -> datetime:
+    now = now.astimezone(timezone.utc)
+    now_epoch = int(now.timestamp())
+    current_epoch = (now_epoch // event_duration_seconds) * event_duration_seconds
+    return datetime.fromtimestamp(current_epoch, tz=timezone.utc)
+
+
+def resolve_active_window(
+    event_slug_prefixes: list[str],
+    event_duration_seconds: int,
+    now: datetime | None = None,
+) -> FullWindow:
+    """Resolve the currently active window from the present UTC timestamp."""
+    timestamp = now or datetime.now(timezone.utc)
+    start_time = current_window_start(timestamp, event_duration_seconds)
+    end_time = datetime.fromtimestamp(start_time.timestamp() + event_duration_seconds, tz=timezone.utc)
+    start_epoch = int(start_time.timestamp())
+    event_slugs = [f"{prefix}-{start_epoch}" for prefix in event_slug_prefixes]
+    return FullWindow(start=start_time, end=end_time, event_slugs=event_slugs)
+
+
 def parse_window_start(value: str) -> datetime:
     if value.isdigit():
         return datetime.fromtimestamp(int(value), tz=timezone.utc)

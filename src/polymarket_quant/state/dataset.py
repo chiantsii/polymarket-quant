@@ -17,6 +17,87 @@ from polymarket_quant.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def filter_complete_event_windows(
+    orderbooks: pd.DataFrame,
+    spot: pd.DataFrame,
+    orderbook_levels: pd.DataFrame | None = None,
+    *,
+    event_duration_seconds: float = 300.0,
+    coverage_tolerance_seconds: float = 2.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Keep only interior event_slug windows from continuous capture runs."""
+    prepared_orderbooks = prepare_orderbooks(orderbooks)
+    prepared_spot = prepare_spot(spot)
+    prepared_levels = None
+    if orderbook_levels is not None and not orderbook_levels.empty:
+        prepared_levels = prepare_orderbook_levels(orderbook_levels)
+
+    del coverage_tolerance_seconds  # slug-first filtering no longer uses boundary timing thresholds
+
+    complete_event_slugs: list[str] = []
+    dropped_events: list[dict[str, Any]] = []
+    available_spot_slugs = set(prepared_spot.get("event_slug", pd.Series(dtype=object)).dropna().astype(str))
+
+    orderbook_events = (
+        prepared_orderbooks[["asset", "event_slug"]]
+        .dropna()
+        .drop_duplicates()
+        .assign(
+            event_start_epoch=lambda frame: frame["event_slug"]
+            .astype(str)
+            .str.rsplit("-", n=1)
+            .str[-1]
+        )
+    )
+    orderbook_events["event_start_epoch"] = pd.to_numeric(orderbook_events["event_start_epoch"], errors="coerce")
+    orderbook_events = orderbook_events.dropna(subset=["event_start_epoch"]).copy()
+    orderbook_events["event_start_epoch"] = orderbook_events["event_start_epoch"].astype(int)
+
+    for asset, asset_events in orderbook_events.groupby("asset", sort=False):
+        asset_events = asset_events.sort_values("event_start_epoch").reset_index(drop=True)
+        if asset_events.empty:
+            continue
+
+        run_breaks = asset_events["event_start_epoch"].diff().ne(int(event_duration_seconds)).fillna(True)
+        asset_events["_run_id"] = run_breaks.cumsum()
+
+        for _, run in asset_events.groupby("_run_id", sort=False):
+            run_slugs = run["event_slug"].astype(str).tolist()
+            if len(run_slugs) <= 2:
+                dropped_events.extend({"event_slug": slug, "reason": "edge_window_in_short_run"} for slug in run_slugs)
+                continue
+
+            interior_slugs = run_slugs[1:-1]
+            edge_slugs = [run_slugs[0], run_slugs[-1]]
+            dropped_events.extend({"event_slug": slug, "reason": "edge_window_in_continuous_run"} for slug in edge_slugs)
+
+            for slug in interior_slugs:
+                if slug not in available_spot_slugs:
+                    dropped_events.append({"event_slug": slug, "reason": "missing_spot_event_slug"})
+                    continue
+                complete_event_slugs.append(slug)
+
+    complete_event_slugs = sorted(set(complete_event_slugs))
+    filtered_orderbooks = orderbooks[orderbooks["event_slug"].isin(complete_event_slugs)].copy()
+    filtered_levels = None
+    if orderbook_levels is not None:
+        filtered_levels = orderbook_levels[orderbook_levels["event_slug"].isin(complete_event_slugs)].copy()
+
+    if dropped_events:
+        preview = dropped_events[:5]
+        logger.warning(
+            "Dropped %s incomplete event windows before market-state construction. Examples: %s",
+            len(dropped_events),
+            preview,
+        )
+    logger.info(
+        "Retained %s/%s complete event windows for market-state construction",
+        len(complete_event_slugs),
+        prepared_orderbooks["event_slug"].nunique(),
+    )
+    return filtered_orderbooks, spot.copy(), filtered_levels
+
+
 def build_market_state_dataset(
     orderbooks: pd.DataFrame,
     spot: pd.DataFrame,
@@ -317,7 +398,7 @@ def build_reference_prices(
         reference_tick = in_window.iloc[0]
         references[event_slug] = {
             "price": float(reference_tick["price"]),
-            "source": "first_observed_coinbase_spot_in_event_window",
+            "source": "first_observed_spot_in_event_window",
             "collected_at": reference_tick["collected_at"],
         }
     return references
