@@ -8,7 +8,7 @@ The current scope is:
 data capture
 -> market_state
 -> event_state
--> latent probability / regime Markov modeling
+-> structured next-state / spot-kernel modeling
 -> binary payoff fair-price model
 -> edge extraction
 ```
@@ -84,30 +84,40 @@ Where:
 
 ## Transition Research Objective
 
-The first transition model should not try to predict repair outcomes or final winners.
-
-Its first job is:
+The current transition layer is built from:
 
 ```text
-predict the conditional drift, diffusion, and jump intensity
-of future latent_logit_probability given current S_t
+event_state rows
+-> next-observation pairing within the same event_slug
+-> current_* / future_* / target_delta_* transition targets
+-> learned drift / diffusion / jump heads
 ```
 
-Equivalently, the first supervised target should be built around:
+The goal is not to predict repair outcomes or final winner labels directly.
+Instead, the transition model learns a structured approximation to:
 
 ```text
-X_t = latent_logit_probability
-P(X_{t+Δ} | S_t)
+P(S_{n+1} | S_n)
 ```
 
-In practice this means the first model should learn:
+In the current codebase, this serves two practical purposes:
 
-- where future latent logit is centered
-- how uncertain the next state is
-- when the transition kernel becomes jump-like instead of smooth
+- learn next-state structure for the full event state
+- learn a state-conditioned log-spot jump-diffusion kernel used by pricing replay
+
+That pricing-relevant kernel is the object consumed by
+`MarkovSimulationEngine`:
+
+```text
+log spot_{t+Δ}
+= log spot_t
++ drift(S_t) * Δt
++ diffusion(S_t) * sqrt(Δt) * ε
++ jump(S_t)
+```
 
 These transition quantities are not part of `L_t`; they belong to the learned
-kernel used by `fit_transition_model.py`.
+kernel produced by `fit_transition_model.py`.
 
 ## Current Architecture
 
@@ -145,11 +155,11 @@ event_state = S_t
     ↓
 build_transition_targets.py
     ↓
-structured transition targets for P(S_{n+1} | S_n)
+structured next-observation transition targets for P(S_{n+1} | S_n)
     ↓
 fit_transition_model.py
     ↓
-drift / diffusion / jump heads for latent-state research
+drift / diffusion / jump heads for state evolution and spot-kernel pricing
 ```
 
 ## Core Principles
@@ -170,22 +180,22 @@ drift / diffusion / jump heads for latent-state research
 
 Implemented:
 
-- aligned 5-minute data capture
+- continuous aligned data capture with 5-minute chunk flushes
 - token-level `market_state`
 - event-level `event_state`
 - `M_t v2` market-observation features
 - `L_t v1` latent/mechanism features
-- structured transition targets for `P(S_{t+Δ} | S_t)`
-- first transition model with drift / diffusion / jump outputs
+- structured next-observation transition targets for `P(S_{n+1} | S_n)`
+- first transition model with learned drift / diffusion / jump outputs
 - Monte Carlo spot-terminal binary payoff pricing replay
   - replay pricing currently consumes `event_state`
   - each path is priced by whether terminal spot finishes above the market reference opening price
-  - current pricing replay does not require a trained transition-model artifact
+  - current pricing replay loads a trained transition-model artifact to obtain the learned spot kernel
 
 Current next-step focus:
 
-- strengthen the latent-state transition research track
-- improve regime and jump modeling for state evolution
+- strengthen the structured state-transition research track
+- improve regime and jump modeling for state evolution and spot dynamics
 - continue validating spot-terminal binary payoff pricing against market edge behavior
 
 ## Quick Start
@@ -198,7 +208,7 @@ source venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Capture one full 5-minute window:
+Capture continuously for one 5-minute chunk of wall-clock time:
 
 ```bash
 venv/bin/python scripts/run_window_capture.py --windows 1 --interval-seconds 1
@@ -215,8 +225,6 @@ Build event state:
 ```bash
 venv/bin/python scripts/build_event_state.py
 ```
-
-Optional transition research:
 
 Build transition targets:
 
@@ -239,8 +247,18 @@ venv/bin/python scripts/replay_pricing.py --pricing-method markov_mcmc
 `replay_pricing.py` now consumes serialized `event_state` rows directly and reads
 `data/processed/crypto_5m_event_state_latest.parquet` by default.
 
-You do not need to fit a transition model before running the current pricing
-replay path.
+`replay_pricing.py` expects a trained transition-model artifact at:
+
+```text
+artifacts/transition_model/transition_model_latest.joblib
+```
+
+If it is missing, first run:
+
+```bash
+venv/bin/python scripts/build_transition_targets.py
+venv/bin/python scripts/fit_transition_model.py
+```
 
 Useful replay options:
 
