@@ -12,6 +12,7 @@ dist/
 *.egg-info/
 .env
 TASK.md
+COMMEND.md
 data/
 artifacts/*
 !artifacts/.gitkeep
