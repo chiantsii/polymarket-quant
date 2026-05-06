@@ -79,9 +79,13 @@ def filter_complete_event_windows(
 
     complete_event_slugs = sorted(set(complete_event_slugs))
     filtered_orderbooks = orderbooks[orderbooks["event_slug"].isin(complete_event_slugs)].copy()
+    filtered_spot = spot[spot["event_slug"].isin(complete_event_slugs)].copy()
     filtered_levels = None
     if orderbook_levels is not None:
-        filtered_levels = orderbook_levels[orderbook_levels["event_slug"].isin(complete_event_slugs)].copy()
+        if not orderbook_levels.empty and "event_slug" in orderbook_levels.columns:
+            filtered_levels = orderbook_levels[orderbook_levels["event_slug"].isin(complete_event_slugs)].copy()
+        else:
+            filtered_levels = orderbook_levels.copy()
 
     if dropped_events:
         preview = dropped_events[:5]
@@ -95,7 +99,7 @@ def filter_complete_event_windows(
         len(complete_event_slugs),
         prepared_orderbooks["event_slug"].nunique(),
     )
-    return filtered_orderbooks, spot.copy(), filtered_levels
+    return filtered_orderbooks, filtered_spot, filtered_levels
 
 
 def build_market_state_dataset(
@@ -105,8 +109,35 @@ def build_market_state_dataset(
     state_builder: LatentMarkovStateBuilder | None = None,
     spot_tolerance_seconds: float = 2.0,
     event_duration_seconds: float = 300.0,
+    reference_prices_by_event: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Build a continuous market-state dataset from aligned orderbook and spot data."""
+    state_builder = state_builder or LatentMarkovStateBuilder()
+    state = build_market_state_rows(
+        orderbooks=orderbooks,
+        spot=spot,
+        orderbook_levels=orderbook_levels,
+        state_builder=state_builder,
+        spot_tolerance_seconds=spot_tolerance_seconds,
+        event_duration_seconds=event_duration_seconds,
+        reference_prices_by_event=reference_prices_by_event,
+    )
+    return finalize_market_state_rows(
+        state,
+        fallback_volatility_per_sqrt_second=state_builder.config.fallback_volatility_per_sqrt_second,
+    )
+
+
+def build_market_state_rows(
+    orderbooks: pd.DataFrame,
+    spot: pd.DataFrame,
+    orderbook_levels: pd.DataFrame | None = None,
+    state_builder: LatentMarkovStateBuilder | None = None,
+    spot_tolerance_seconds: float = 2.0,
+    event_duration_seconds: float = 300.0,
+    reference_prices_by_event: dict[str, dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """Build raw state rows before velocity/basis enrichment."""
     state_builder = state_builder or LatentMarkovStateBuilder()
 
     prepared_orderbooks = prepare_orderbooks(orderbooks)
@@ -118,7 +149,7 @@ def build_market_state_dataset(
             prepared_orderbooks = prepared_orderbooks.merge(level_features, on=merge_keys, how="left")
     prepared_spot = prepare_spot(spot)
     spot_by_asset = {asset: frame for asset, frame in prepared_spot.groupby("asset", sort=False)}
-    reference_prices = build_reference_prices(
+    reference_prices = reference_prices_by_event or build_reference_prices(
         orderbooks=prepared_orderbooks,
         spot_by_asset=spot_by_asset,
         event_duration_seconds=event_duration_seconds,
@@ -152,10 +183,19 @@ def build_market_state_dataset(
     if not state_rows:
         raise ValueError("No market-state rows were generated. Check spot/orderbook timestamp overlap.")
 
-    state = pd.DataFrame(state_rows)
+    return pd.DataFrame(state_rows)
+
+
+def finalize_market_state_rows(
+    state_rows: pd.DataFrame,
+    *,
+    fallback_volatility_per_sqrt_second: float,
+) -> pd.DataFrame:
+    """Add market-observation and latent features to raw state rows."""
+    state = state_rows.copy()
     state = _add_market_observation_v2_features(
         state,
-        fallback_volatility_per_sqrt_second=state_builder.config.fallback_volatility_per_sqrt_second,
+        fallback_volatility_per_sqrt_second=fallback_volatility_per_sqrt_second,
     )
     state = _add_latent_mechanism_features(state)
     return state

@@ -1,9 +1,11 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from scripts.build_market_state import build_market_state
 from polymarket_quant.state import (
     LatentMarkovStateBuilder,
     LatentMarkovStateConfig,
@@ -525,7 +527,8 @@ def test_filter_complete_event_windows_keeps_only_full_event_slug_coverage() -> 
 
     assert set(filtered_orderbooks["event_slug"]) == {slug_b, slug_c}
     assert set(filtered_levels["event_slug"]) == {slug_b, slug_c}
-    assert len(filtered_spot) == len(spot)
+    assert set(filtered_spot["event_slug"]) == {slug_b, slug_c}
+    assert len(filtered_spot) == 4
 
 
 def test_fundamental_probability_uses_gbm_terminal_crossing_probability() -> None:
@@ -647,3 +650,141 @@ def test_observation_variance_penalizes_thin_or_stale_books() -> None:
         )
         == 0.0
     )
+
+
+def test_build_market_state_file_batching_matches_full_mode(tmp_path: Path) -> None:
+    def event_window_from_slug(event_slug: str) -> tuple[datetime, datetime]:
+        start = datetime.fromtimestamp(int(event_slug.rsplit("-", 1)[-1]), tz=timezone.utc)
+        return start, start + timedelta(minutes=5)
+
+    def orderbook_row(timestamp: datetime, event_slug: str, outcome_name: str, token_id: str, mid: float) -> dict:
+        event_start, event_end = event_window_from_slug(event_slug)
+        best_bid = max(1e-6, mid - 0.005)
+        best_ask = min(0.999999, mid + 0.005)
+        return {
+            "series_slug": "btc-up-or-down-5m",
+            "asset": "BTC",
+            "event_id": f"event_{event_slug}",
+            "event_slug": event_slug,
+            "event_title": f"Bitcoin Up or Down - {event_slug}",
+            "market_id": f"mkt_{event_slug}",
+            "condition_id": f"cond_{event_slug}",
+            "token_id": token_id,
+            "outcome_name": outcome_name,
+            "market_start_time": event_start.isoformat(),
+            "market_end_time": event_end.isoformat(),
+            "closed": False,
+            "accepting_orders": True,
+            "collected_at": timestamp.isoformat(),
+            "book_timestamp": timestamp.isoformat(),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": best_ask - best_bid,
+            "mid_price": (best_bid + best_ask) / 2.0,
+            "bid_depth": 120.0,
+            "ask_depth": 110.0,
+            "bid_depth_top_5": 90.0,
+            "ask_depth_top_5": 85.0,
+            "orderbook_imbalance": 0.05 if outcome_name == "Up" else -0.05,
+            "bid_levels": 2,
+            "ask_levels": 2,
+            "book_hash": f"hash_{event_slug}_{outcome_name}_{timestamp.timestamp()}",
+        }
+
+    def spot_row(timestamp: datetime, event_slug: str, price: float) -> dict:
+        return {
+            "asset": "BTC",
+            "event_slug": event_slug,
+            "product_id": "BTCUSDT",
+            "source": "binance_book_ticker",
+            "collected_at": timestamp.isoformat(),
+            "exchange_time": timestamp.isoformat(),
+            "price": price,
+            "bid": price - 0.01,
+            "ask": price + 0.01,
+            "size": 1.0,
+            "volume": 100.0,
+            "trade_id": int(timestamp.timestamp()),
+        }
+
+    asset_dir = tmp_path / "data" / "BTC" / "processed"
+    polymarket_dir = asset_dir / "polymarket"
+    spot_dir = asset_dir / "spot"
+    polymarket_dir.mkdir(parents=True)
+    spot_dir.mkdir(parents=True)
+
+    slug_a = "btc-updown-5m-1775578800"
+    slug_b = "btc-updown-5m-1775579100"
+    slug_c = "btc-updown-5m-1775579400"
+    slug_d = "btc-updown-5m-1775579700"
+
+    file_specs = [
+        (
+            "20260428_094500",
+            [
+                (slug_a, datetime.fromtimestamp(1775578801, tz=timezone.utc), 100.00, 0.50),
+                (slug_b, datetime.fromtimestamp(1775579101, tz=timezone.utc), 100.50, 0.51),
+                (slug_b, datetime.fromtimestamp(1775579102, tz=timezone.utc), 100.55, 0.515),
+            ],
+        ),
+        (
+            "20260428_095000",
+            [
+                (slug_b, datetime.fromtimestamp(1775579103, tz=timezone.utc), 100.60, 0.52),
+                (slug_c, datetime.fromtimestamp(1775579401, tz=timezone.utc), 101.00, 0.53),
+            ],
+        ),
+        (
+            "20260428_095500",
+            [
+                (slug_c, datetime.fromtimestamp(1775579402, tz=timezone.utc), 101.10, 0.535),
+                (slug_c, datetime.fromtimestamp(1775579403, tz=timezone.utc), 101.20, 0.54),
+                (slug_d, datetime.fromtimestamp(1775579701, tz=timezone.utc), 101.50, 0.55),
+            ],
+        ),
+    ]
+
+    for suffix, rows in file_specs:
+        summary_rows = []
+        spot_rows = []
+        for event_slug, timestamp, spot_price, up_mid in rows:
+            summary_rows.append(orderbook_row(timestamp, event_slug, "Up", f"tok_up_{event_slug}", up_mid))
+            summary_rows.append(orderbook_row(timestamp, event_slug, "Down", f"tok_down_{event_slug}", 1.0 - up_mid))
+            spot_rows.append(spot_row(timestamp, event_slug, spot_price))
+
+        pd.DataFrame(summary_rows).to_parquet(
+            polymarket_dir / f"crypto_5m_orderbook_summary_{suffix}.parquet",
+            index=False,
+        )
+        pd.DataFrame(spot_rows).to_parquet(
+            spot_dir / f"binance_spot_ticks_{suffix}.parquet",
+            index=False,
+        )
+
+    summary_glob = str(polymarket_dir / "crypto_5m_orderbook_summary_*.parquet")
+    levels_glob = str(polymarket_dir / "crypto_5m_orderbook_levels_*.parquet")
+    spot_glob = str(spot_dir / "binance_spot_ticks_*.parquet")
+
+    full_output_dir = tmp_path / "full_out"
+    file_output_dir = tmp_path / "file_out"
+    full_result = build_market_state(
+        orderbook_glob=summary_glob,
+        orderbook_levels_glob=levels_glob,
+        spot_glob=spot_glob,
+        output_dir=str(full_output_dir),
+        batch_mode="full",
+        run_timestamp="full_test",
+    )
+    file_result = build_market_state(
+        orderbook_glob=summary_glob,
+        orderbook_levels_glob=levels_glob,
+        spot_glob=spot_glob,
+        output_dir=str(file_output_dir),
+        batch_mode="file",
+        run_timestamp="file_test",
+    )
+
+    full_state = pd.read_parquet(full_result["output_path"]).sort_values(["event_slug", "token_id", "collected_at"]).reset_index(drop=True)
+    file_state = pd.read_parquet(file_result["output_path"]).sort_values(["event_slug", "token_id", "collected_at"]).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(full_state, file_state, check_like=False, check_dtype=False)
