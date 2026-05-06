@@ -17,6 +17,11 @@ from polymarket_quant.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _parse_iso8601_utc(series: pd.Series) -> pd.Series:
+    """Parse mixed ISO8601 timestamp strings robustly across pandas versions."""
+    return pd.to_datetime(series, utc=True, format="ISO8601", errors="coerce")
+
+
 def filter_complete_event_windows(
     orderbooks: pd.DataFrame,
     spot: pd.DataFrame,
@@ -375,7 +380,7 @@ def prepare_orderbooks(orderbooks: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Orderbook data is missing columns: {sorted(missing)}")
 
     prepared = orderbooks.copy()
-    prepared["_collected_at_dt"] = pd.to_datetime(prepared["collected_at"], utc=True)
+    prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
     prepared = prepared.dropna(subset=["_collected_at_dt", "event_slug", "asset"])
     return prepared.sort_values("_collected_at_dt").reset_index(drop=True)
 
@@ -387,7 +392,7 @@ def prepare_orderbook_levels(orderbook_levels: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Orderbook level data is missing columns: {sorted(missing)}")
 
     prepared = orderbook_levels.copy()
-    prepared["_collected_at_dt"] = pd.to_datetime(prepared["collected_at"], utc=True)
+    prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
     prepared["level"] = pd.to_numeric(prepared["level"], errors="coerce")
     prepared["price"] = pd.to_numeric(prepared["price"], errors="coerce")
     prepared["size"] = pd.to_numeric(prepared["size"], errors="coerce")
@@ -406,7 +411,7 @@ def prepare_spot(spot: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Spot data is missing columns: {sorted(missing)}")
 
     prepared = spot.copy()
-    prepared["_collected_at_dt"] = pd.to_datetime(prepared["collected_at"], utc=True)
+    prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
     prepared["price"] = pd.to_numeric(prepared["price"], errors="coerce")
     prepared = prepared.dropna(subset=["_collected_at_dt", "asset", "price"])
     return prepared.sort_values("_collected_at_dt").reset_index(drop=True)
@@ -563,7 +568,7 @@ def _add_market_observation_v2_features(
 
     group_cols = [column for column in ("event_slug", "token_id") if column in prepared.columns]
     if group_cols:
-        prepared["_collected_at_dt"] = pd.to_datetime(prepared["collected_at"], utc=True)
+        prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
         prepared["_dt_seconds"] = (
             prepared.groupby(group_cols)["_collected_at_dt"].diff().dt.total_seconds().replace(0.0, np.nan)
         )

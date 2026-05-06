@@ -34,6 +34,11 @@ LEVELS_PREFIX = "crypto_5m_orderbook_levels_"
 SPOT_PREFIX = "binance_spot_ticks_"
 
 
+def _parse_iso8601_utc(series: pd.Series) -> pd.Series:
+    """Parse mixed ISO8601 timestamp strings robustly across pandas versions."""
+    return pd.to_datetime(series, utc=True, format="ISO8601", errors="coerce")
+
+
 def _build_state_config(
     *,
     event_duration_seconds: float,
@@ -311,13 +316,13 @@ def _trim_spot_context(
     if spot_frame.empty or "collected_at" not in spot_frame.columns:
         return spot_frame
     prepared = spot_frame.copy()
-    prepared["_collected_at_dt"] = pd.to_datetime(prepared["collected_at"], utc=True)
+    prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
     prepared = prepared.dropna(subset=["_collected_at_dt"]).sort_values("_collected_at_dt")
     cutoff = prepared["_collected_at_dt"].max() - pd.Timedelta(seconds=context_seconds)
     trimmed = prepared[prepared["_collected_at_dt"] >= cutoff].copy()
     if preserve_all_current and current_batch is not None and not current_batch.empty:
         current = current_batch.copy()
-        current["_collected_at_dt"] = pd.to_datetime(current["collected_at"], utc=True)
+        current["_collected_at_dt"] = _parse_iso8601_utc(current["collected_at"])
         trimmed = pd.concat([trimmed, current], ignore_index=True).drop_duplicates().sort_values("_collected_at_dt")
     return trimmed.drop(columns=["_collected_at_dt"], errors="ignore").reset_index(drop=True)
 
