@@ -39,6 +39,15 @@ class LatentMarkovStateEstimate:
     observation_variance: Optional[float]
 
 
+@dataclass(frozen=True)
+class EventObservationSummary:
+    """One-pass summary of event-level book observations."""
+
+    market_implied_up_probability: Optional[float]
+    observation_variance: Optional[float]
+    row_book_ages: tuple[Optional[float], ...]
+
+
 class LatentMarkovStateBuilder:
     """Construct observation and latent state rows from aligned market data."""
 
@@ -94,7 +103,7 @@ class LatentMarkovStateBuilder:
             # 2. a market-implied observation from the orderbook
             # 3. the previous latent state propagated forward in time
             volatility = self._realized_volatility_per_sqrt_second(asset, timestamp)
-            market_implied_up_probability = self._market_implied_up_probability(event_rows)
+            observation_summary = self._event_observation_summary(event_rows, timestamp)
             estimate = self._estimate_latent_state(
                 event_slug=event_slug,
                 timestamp=timestamp,
@@ -102,16 +111,16 @@ class LatentMarkovStateBuilder:
                 reference_price=reference_price,
                 volatility=volatility,
                 seconds_to_end=seconds_to_end,
-                market_implied_up_probability=market_implied_up_probability,
-                event_rows=event_rows,
+                market_implied_up_probability=observation_summary.market_implied_up_probability,
+                observation_variance=observation_summary.observation_variance,
             )
 
-            for row in event_rows:
+            for row, book_age_seconds in zip(event_rows, observation_summary.row_book_ages):
                 state_rows.append(
                     {
                         **row,
                         "state_timestamp": timestamp.isoformat(),
-                        "book_age_seconds": self._book_age_seconds(row, timestamp),
+                        "book_age_seconds": book_age_seconds,
                         "spot_source": spot_tick.get("source"),
                         "spot_product_id": spot_tick.get("product_id"),
                         "spot_exchange_time": spot_tick.get("exchange_time"),
@@ -142,7 +151,7 @@ class LatentMarkovStateBuilder:
         volatility: float,
         seconds_to_end: float,
         market_implied_up_probability: Optional[float],
-        event_rows: List[Dict[str, Any]],
+        observation_variance: Optional[float],
     ) -> LatentMarkovStateEstimate:
         # The fundamental probability is the model's external anchor: given
         # spot, reference, volatility, and time-to-end, what is the implied
@@ -154,12 +163,13 @@ class LatentMarkovStateBuilder:
             seconds_to_end=seconds_to_end,
         )
         anchor_logit = float(logit(np.clip(fundamental_probability, 1e-6, 1 - 1e-6)))
-        observation_variance = None
         latent_logit = anchor_logit
         if market_implied_up_probability is not None:
             observation_logit = float(logit(np.clip(market_implied_up_probability, 1e-6, 1 - 1e-6)))
-            observation_variance = self._observation_variance(event_rows, timestamp)
-            anchor_variance = self._anchor_variance(observation_variance)
+            resolved_observation_variance = (
+                observation_variance if observation_variance is not None else self.config.observation_std**2
+            )
+            anchor_variance = self._anchor_variance(resolved_observation_variance)
             # Current latent state is a present-time fusion of the fundamental
             # anchor and the current market observation. Transition dynamics are
             # learned later in the transition kernel, not hard-coded here.
@@ -167,8 +177,9 @@ class LatentMarkovStateBuilder:
                 prior_mean=anchor_logit,
                 prior_variance=anchor_variance,
                 observation_mean=observation_logit,
-                observation_variance=observation_variance,
+                observation_variance=resolved_observation_variance,
             )
+            observation_variance = resolved_observation_variance
 
         latent_probability = float(sigmoid(latent_logit))
         return LatentMarkovStateEstimate(
@@ -180,28 +191,7 @@ class LatentMarkovStateBuilder:
         )
 
     def _market_implied_up_probability(self, event_rows: List[Dict[str, Any]]) -> Optional[float]:
-        up_mid = None
-        down_mid = None
-        for row in event_rows:
-            outcome = str(row.get("outcome_name", "")).lower()
-            mid = self._row_mid_probability(row)
-            if mid is None:
-                continue
-            if outcome == "up":
-                up_mid = mid
-            elif outcome == "down":
-                down_mid = mid
-
-        # We reconcile the two-sided binary book by averaging the direct Up
-        # quote with the Down quote mapped back into Up-probability space.
-        candidates = []
-        if up_mid is not None:
-            candidates.append(up_mid)
-        if down_mid is not None:
-            candidates.append(1.0 - down_mid)
-        if not candidates:
-            return None
-        return float(np.clip(np.mean(candidates), 1e-6, 1 - 1e-6))
+        return self._event_observation_summary(event_rows, timestamp=None).market_implied_up_probability
 
     def _row_mid_probability(self, row: Dict[str, Any]) -> Optional[float]:
         mid = self._to_float(row.get("mid_price"))
@@ -236,15 +226,43 @@ class LatentMarkovStateBuilder:
         return float(max(observation_variance * (1.0 - anchor_weight) / anchor_weight, 1e-6))
 
     def _observation_variance(self, event_rows: List[Dict[str, Any]], timestamp: datetime) -> float:
+        return self._event_observation_summary(event_rows, timestamp).observation_variance or max(
+            self.config.observation_std**2,
+            1e-6,
+        )
+
+    def _event_observation_summary(
+        self,
+        event_rows: List[Dict[str, Any]],
+        timestamp: Optional[datetime],
+    ) -> EventObservationSummary:
         base_variance = max(self.config.observation_std**2, 1e-6)
 
         logit_half_width_variances: List[float] = []
         observation_logits: List[float] = []
         displayed_depths: List[float] = []
         book_ages: List[float] = []
+        row_book_ages: List[Optional[float]] = []
+        up_mid = None
+        down_mid = None
 
         for row in event_rows:
-            interval = self._row_probability_interval(row)
+            outcome = str(row.get("outcome_name", "")).lower()
+            best_bid = self._to_float(row.get("best_bid"))
+            best_ask = self._to_float(row.get("best_ask"))
+            mid = self._mid_probability_from_quotes(row, best_bid=best_bid, best_ask=best_ask)
+            if mid is not None:
+                if outcome == "up":
+                    up_mid = mid
+                elif outcome == "down":
+                    down_mid = mid
+
+            interval = self._probability_interval_from_observed(
+                outcome=outcome,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                mid=mid,
+            )
             if interval is not None:
                 lower, upper = interval
                 lower_logit = float(logit(lower))
@@ -252,13 +270,29 @@ class LatentMarkovStateBuilder:
                 observation_logits.append(0.5 * (lower_logit + upper_logit))
                 logit_half_width_variances.append((0.5 * abs(upper_logit - lower_logit)) ** 2)
 
-            depth = self._row_displayed_depth(row)
+            depth = self._displayed_depth_from_quotes(
+                bid_depth=self._to_float(row.get("bid_depth_top_5")),
+                ask_depth=self._to_float(row.get("ask_depth_top_5")),
+            )
             if depth is not None and depth > 0:
                 displayed_depths.append(depth)
 
-            age = self._book_age_seconds(row, timestamp)
+            age = self._book_age_seconds(row, timestamp) if timestamp is not None else None
+            row_book_ages.append(age)
             if age is not None and age >= 0:
                 book_ages.append(age)
+
+        market_implied_up_probability = self._market_implied_up_probability_from_mids(
+            up_mid=up_mid,
+            down_mid=down_mid,
+        )
+
+        if market_implied_up_probability is None:
+            return EventObservationSummary(
+                market_implied_up_probability=None,
+                observation_variance=None,
+                row_book_ages=tuple(row_book_ages),
+            )
 
         # Observation noise rises when:
         # - displayed quote intervals are wide
@@ -286,7 +320,11 @@ class LatentMarkovStateBuilder:
             + (self.config.observation_spread_scale * quote_variance)
             + (self.config.observation_disagreement_scale * disagreement_variance)
         ) * depth_penalty * staleness_penalty
-        return float(max(variance, 1e-6))
+        return EventObservationSummary(
+            market_implied_up_probability=market_implied_up_probability,
+            observation_variance=float(max(variance, 1e-6)),
+            row_book_ages=tuple(row_book_ages),
+        )
 
     def _event_spread(self, event_rows: List[Dict[str, Any]]) -> float:
         spreads = []
@@ -305,7 +343,23 @@ class LatentMarkovStateBuilder:
         outcome = str(row.get("outcome_name", "")).lower()
         best_bid = self._to_float(row.get("best_bid"))
         best_ask = self._to_float(row.get("best_ask"))
-        mid = self._row_mid_probability(row)
+        mid = self._mid_probability_from_quotes(row, best_bid=best_bid, best_ask=best_ask)
+
+        return self._probability_interval_from_observed(
+            outcome=outcome,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            mid=mid,
+        )
+
+    def _probability_interval_from_observed(
+        self,
+        *,
+        outcome: str,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+        mid: Optional[float],
+    ) -> Optional[tuple[float, float]]:
 
         lower: Optional[float]
         upper: Optional[float]
@@ -332,6 +386,14 @@ class LatentMarkovStateBuilder:
     def _row_displayed_depth(self, row: Dict[str, Any]) -> Optional[float]:
         bid_depth = self._to_float(row.get("bid_depth_top_5"))
         ask_depth = self._to_float(row.get("ask_depth_top_5"))
+        return self._displayed_depth_from_quotes(bid_depth=bid_depth, ask_depth=ask_depth)
+
+    def _displayed_depth_from_quotes(
+        self,
+        *,
+        bid_depth: Optional[float],
+        ask_depth: Optional[float],
+    ) -> Optional[float]:
         if bid_depth is not None and ask_depth is not None:
             return max(min(bid_depth, ask_depth), 0.0)
         if bid_depth is not None:
@@ -339,6 +401,21 @@ class LatentMarkovStateBuilder:
         if ask_depth is not None:
             return max(ask_depth, 0.0)
         return None
+
+    def _market_implied_up_probability_from_mids(
+        self,
+        *,
+        up_mid: Optional[float],
+        down_mid: Optional[float],
+    ) -> Optional[float]:
+        candidates = []
+        if up_mid is not None:
+            candidates.append(up_mid)
+        if down_mid is not None:
+            candidates.append(1.0 - down_mid)
+        if not candidates:
+            return None
+        return float(np.clip(np.mean(candidates), 1e-6, 1 - 1e-6))
 
     def _book_age_seconds(self, row: Dict[str, Any], timestamp: datetime) -> Optional[float]:
         book_timestamp = row.get("book_timestamp")
@@ -443,6 +520,24 @@ class LatentMarkovStateBuilder:
             or self._parse_timestamp(row.get("book_timestamp"))
             or self._parse_timestamp(spot_tick.get("collected_at"))
         )
+
+    def _mid_probability_from_quotes(
+        self,
+        row: Dict[str, Any],
+        *,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+    ) -> Optional[float]:
+        mid = self._to_float(row.get("mid_price"))
+        if mid is not None:
+            return float(np.clip(mid, 1e-6, 1 - 1e-6))
+        if best_bid is not None and best_ask is not None:
+            return float(np.clip((best_bid + best_ask) / 2.0, 1e-6, 1 - 1e-6))
+        if best_bid is not None:
+            return float(np.clip(best_bid, 1e-6, 1 - 1e-6))
+        if best_ask is not None:
+            return float(np.clip(best_ask, 1e-6, 1 - 1e-6))
+        return None
 
     def _parse_timestamp(self, value: Any) -> Optional[datetime]:
         if value is None:

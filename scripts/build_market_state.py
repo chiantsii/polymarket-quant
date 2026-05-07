@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import pandas as pd
@@ -163,91 +164,100 @@ def _build_market_state_file_batched(
     level_path_map = _build_file_path_map(levels_paths, prefix=LEVELS_PREFIX)
     spot_path_map = _build_file_path_map(spot_paths, prefix=SPOT_PREFIX)
     spot_context_by_asset: dict[str, pd.DataFrame] = {}
-    raw_state_batches: list[pd.DataFrame] = []
     builder = LatentMarkovStateBuilder(state_config)
+    with TemporaryDirectory(prefix="market_state_raw_batches_") as tmpdir:
+        temp_dir = Path(tmpdir)
+        raw_state_batch_paths: list[Path] = []
 
-    for index, summary_path in enumerate(summary_paths, start=1):
-        batch_started_at = perf_counter()
-        asset = _path_asset(summary_path)
-        batch_key = (asset, _path_suffix(summary_path, SUMMARY_PREFIX))
-        logger.info(
-            "Processing market-state summary file %s/%s: %s",
-            index,
-            len(summary_paths),
-            summary_path.name,
-        )
-
-        orderbooks = pd.read_parquet(summary_path)
-        orderbooks = orderbooks[orderbooks["event_slug"].isin(complete_event_slugs)].copy()
-        if orderbooks.empty:
+        for index, summary_path in enumerate(summary_paths, start=1):
+            batch_started_at = perf_counter()
+            asset = _path_asset(summary_path)
+            batch_key = (asset, _path_suffix(summary_path, SUMMARY_PREFIX))
             logger.info(
-                "Skipping summary file %s/%s after complete-window filtering: %s",
+                "Processing market-state summary file %s/%s: %s",
                 index,
                 len(summary_paths),
                 summary_path.name,
             )
-            continue
 
-        spot_batch = _load_optional_batch_parquet(spot_path_map.get(batch_key))
-        if not spot_batch.empty:
-            spot_batch = spot_batch[spot_batch["event_slug"].isin(complete_event_slugs)].copy()
-        spot_batch = _combine_spot_context(
-            previous_context=spot_context_by_asset.get(asset),
-            current_batch=spot_batch,
-            spot_tolerance_seconds=spot_tolerance_seconds,
-        )
-        if spot_batch.empty:
-            logger.warning("Skipping %s because no spot context remained after filtering", summary_path)
-            continue
+            orderbooks = pd.read_parquet(summary_path)
+            orderbooks = orderbooks[orderbooks["event_slug"].isin(complete_event_slugs)].copy()
+            if orderbooks.empty:
+                logger.info(
+                    "Skipping summary file %s/%s after complete-window filtering: %s",
+                    index,
+                    len(summary_paths),
+                    summary_path.name,
+                )
+                continue
 
-        levels_batch = _load_optional_batch_parquet(level_path_map.get(batch_key))
-        if not levels_batch.empty:
-            levels_batch = levels_batch[levels_batch["event_slug"].isin(complete_event_slugs)].copy()
+            spot_batch = _load_optional_batch_parquet(spot_path_map.get(batch_key))
+            if not spot_batch.empty:
+                spot_batch = spot_batch[spot_batch["event_slug"].isin(complete_event_slugs)].copy()
+            spot_batch = _combine_spot_context(
+                previous_context=spot_context_by_asset.get(asset),
+                current_batch=spot_batch,
+                spot_tolerance_seconds=spot_tolerance_seconds,
+            )
+            if spot_batch.empty:
+                logger.warning("Skipping %s because no spot context remained after filtering", summary_path)
+                continue
 
+            levels_batch = _load_optional_batch_parquet(level_path_map.get(batch_key))
+            if not levels_batch.empty:
+                levels_batch = levels_batch[levels_batch["event_slug"].isin(complete_event_slugs)].copy()
+
+            logger.info(
+                "Building raw market-state rows for %s (%s orderbook rows, %s spot rows, %s level rows)",
+                summary_path.name,
+                len(orderbooks),
+                len(spot_batch),
+                len(levels_batch),
+            )
+
+            raw_state = build_market_state_rows(
+                orderbooks=orderbooks,
+                spot=spot_batch,
+                orderbook_levels=levels_batch if not levels_batch.empty else None,
+                state_builder=builder,
+                spot_tolerance_seconds=spot_tolerance_seconds,
+                event_duration_seconds=event_duration_seconds,
+                reference_prices_by_event=reference_prices,
+            )
+            batch_output_path = temp_dir / f"raw_state_batch_{index:04d}.parquet"
+            raw_state.to_parquet(batch_output_path, index=False)
+            raw_state_batch_paths.append(batch_output_path)
+            spot_context_by_asset[asset] = _trim_spot_context(
+                spot_batch,
+                context_seconds=max(spot_tolerance_seconds, SPOT_CONTEXT_BUFFER_SECONDS),
+            )
+            logger.info(
+                "Finished summary file %s/%s: produced %s raw rows in %.2fs (spilled to %s)",
+                index,
+                len(summary_paths),
+                len(raw_state),
+                perf_counter() - batch_started_at,
+                batch_output_path.name,
+            )
+
+        if not raw_state_batch_paths:
+            raise ValueError("No market-state rows were generated from file batches.")
+
+        logger.info("Concatenating %s raw market-state batch parquet file(s)", len(raw_state_batch_paths))
+        concat_started_at = perf_counter()
+        raw_state = pd.concat((pd.read_parquet(path) for path in raw_state_batch_paths), ignore_index=True)
         logger.info(
-            "Building raw market-state rows for %s (%s orderbook rows, %s spot rows, %s level rows)",
-            summary_path.name,
-            len(orderbooks),
-            len(spot_batch),
-            len(levels_batch),
-        )
-
-        raw_state = build_market_state_rows(
-            orderbooks=orderbooks,
-            spot=spot_batch,
-            orderbook_levels=levels_batch if not levels_batch.empty else None,
-            state_builder=builder,
-            spot_tolerance_seconds=spot_tolerance_seconds,
-            event_duration_seconds=event_duration_seconds,
-            reference_prices_by_event=reference_prices,
-        )
-        raw_state_batches.append(raw_state)
-        spot_context_by_asset[asset] = _trim_spot_context(
-            spot_batch,
-            context_seconds=max(spot_tolerance_seconds, SPOT_CONTEXT_BUFFER_SECONDS),
-        )
-        logger.info(
-            "Finished summary file %s/%s: produced %s raw rows in %.2fs",
-            index,
-            len(summary_paths),
+            "Concatenated %s raw rows from temp parquet in %.2fs; finalizing market-state features",
             len(raw_state),
-            perf_counter() - batch_started_at,
+            perf_counter() - concat_started_at,
         )
-
-    if not raw_state_batches:
-        raise ValueError("No market-state rows were generated from file batches.")
-
-    logger.info("Concatenating %s raw market-state batch(es)", len(raw_state_batches))
-    concat_started_at = perf_counter()
-    raw_state = pd.concat(raw_state_batches, ignore_index=True)
-    logger.info("Concatenated %s raw rows in %.2fs; finalizing market-state features", len(raw_state), perf_counter() - concat_started_at)
-    finalize_started_at = perf_counter()
-    state = finalize_market_state_rows(
-        raw_state,
-        fallback_volatility_per_sqrt_second=state_config.fallback_volatility_per_sqrt_second,
-    )
-    logger.info("Finalized %s market-state rows in %.2fs", len(state), perf_counter() - finalize_started_at)
-    return state
+        finalize_started_at = perf_counter()
+        state = finalize_market_state_rows(
+            raw_state,
+            fallback_volatility_per_sqrt_second=state_config.fallback_volatility_per_sqrt_second,
+        )
+        logger.info("Finalized %s market-state rows in %.2fs", len(state), perf_counter() - finalize_started_at)
+        return state
 
 
 def _prepare_batching_metadata(
