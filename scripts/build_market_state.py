@@ -11,14 +11,12 @@ from polymarket_quant.state import (
 )
 from polymarket_quant.state.dataset import (
     build_market_state_rows,
-    build_reference_prices,
+    determine_complete_event_slugs,
     finalize_market_state_rows,
     filter_complete_event_windows,
     load_optional_parquet_glob,
     load_parquet_glob,
     matching_parquet_paths,
-    prepare_orderbooks,
-    prepare_spot,
 )
 from polymarket_quant.utils.logger import get_logger
 
@@ -223,43 +221,77 @@ def _prepare_batching_metadata(
     spot_paths: list[Path],
     event_duration_seconds: float,
 ) -> tuple[set[str], dict[str, dict[str, object]]]:
-    minimal_orderbooks = pd.concat(
-        [
-            pd.read_parquet(
-                path,
-                columns=["collected_at", "event_slug", "asset", "outcome_name", "token_id"],
-            )
-            for path in summary_paths
-        ],
-        ignore_index=True,
-    )
-    minimal_spot = pd.concat(
-        [
-            pd.read_parquet(
-                path,
-                columns=["collected_at", "asset", "price", "event_slug"],
-            )
-            for path in spot_paths
-        ],
-        ignore_index=True,
-    )
-    filtered_orderbooks, filtered_spot, _ = filter_complete_event_windows(
-        orderbooks=minimal_orderbooks,
-        spot=minimal_spot,
-        orderbook_levels=None,
+    orderbook_event_frames: list[pd.DataFrame] = []
+    for index, path in enumerate(summary_paths, start=1):
+        logger.info("Scanning market-state metadata from summary file %s/%s: %s", index, len(summary_paths), path.name)
+        frame = pd.read_parquet(path, columns=["asset", "event_slug"])
+        if frame.empty:
+            continue
+        orderbook_event_frames.append(frame[["asset", "event_slug"]].dropna().drop_duplicates())
+
+    if not orderbook_event_frames:
+        return set(), {}
+
+    compact_orderbook_events = pd.concat(orderbook_event_frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+    total_event_slugs = int(compact_orderbook_events["event_slug"].astype(str).nunique())
+
+    available_spot_slugs: set[str] = set()
+    earliest_spot_by_event: dict[str, dict[str, object]] = {}
+    for index, path in enumerate(spot_paths, start=1):
+        logger.info("Scanning market-state metadata from spot file %s/%s: %s", index, len(spot_paths), path.name)
+        frame = pd.read_parquet(path, columns=["collected_at", "asset", "price", "event_slug"])
+        if frame.empty:
+            continue
+        frame = frame.dropna(subset=["event_slug"]).copy()
+        if frame.empty:
+            continue
+        frame["event_slug"] = frame["event_slug"].astype(str)
+        available_spot_slugs.update(frame["event_slug"].unique().tolist())
+        frame["_collected_at_dt"] = _parse_iso8601_utc(frame["collected_at"])
+        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+        frame = frame.dropna(subset=["_collected_at_dt", "asset", "price"])
+        if frame.empty:
+            continue
+        first_ticks = (
+            frame.sort_values(["event_slug", "_collected_at_dt"])
+            .drop_duplicates(subset=["event_slug"], keep="first")
+            .reset_index(drop=True)
+        )
+        for row in first_ticks.to_dict("records"):
+            event_slug = str(row["event_slug"])
+            current = earliest_spot_by_event.get(event_slug)
+            if current is None or row["_collected_at_dt"] < current["_collected_at_dt"]:
+                earliest_spot_by_event[event_slug] = row
+
+    complete_event_slugs, dropped_events = determine_complete_event_slugs(
+        orderbook_events=compact_orderbook_events,
+        available_spot_slugs=available_spot_slugs,
         event_duration_seconds=event_duration_seconds,
-        coverage_tolerance_seconds=WINDOW_COVERAGE_TOLERANCE_SECONDS,
     )
-    complete_event_slugs = set(filtered_orderbooks["event_slug"].astype(str))
-    reference_prices = build_reference_prices(
-        orderbooks=prepare_orderbooks(filtered_orderbooks),
-        spot_by_asset={
-            asset: frame
-            for asset, frame in prepare_spot(filtered_spot).groupby("asset", sort=False)
-        },
-        event_duration_seconds=event_duration_seconds,
+    if dropped_events:
+        preview = dropped_events[:5]
+        logger.warning(
+            "Dropped %s incomplete event windows before market-state construction. Examples: %s",
+            len(dropped_events),
+            preview,
+        )
+
+    complete_event_slug_set = set(complete_event_slugs)
+    reference_prices = {
+        event_slug: {
+            "price": float(payload["price"]),
+            "source": "first_observed_spot_in_event_window",
+            "collected_at": str(payload["collected_at"]),
+        }
+        for event_slug, payload in earliest_spot_by_event.items()
+        if event_slug in complete_event_slug_set
+    }
+    logger.info(
+        "Retained %s/%s complete event windows for market-state construction",
+        len(complete_event_slugs),
+        total_event_slugs,
     )
-    return complete_event_slugs, reference_prices
+    return complete_event_slug_set, reference_prices
 
 
 def _build_file_path_map(paths: list[Path], *, prefix: str) -> dict[tuple[str, str], Path]:
