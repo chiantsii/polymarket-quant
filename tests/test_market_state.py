@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from scripts.build_event_state import build_event_state
 from scripts.build_market_state import build_market_state
 from polymarket_quant.state import (
     LatentMarkovStateBuilder,
@@ -831,5 +832,161 @@ def test_build_market_state_file_batching_matches_full_mode(tmp_path: Path) -> N
 
     full_state = pd.read_parquet(full_result["output_path"]).sort_values(["event_slug", "token_id", "collected_at"]).reset_index(drop=True)
     file_state = pd.read_parquet(file_result["output_path"]).sort_values(["event_slug", "token_id", "collected_at"]).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(full_state, file_state, check_like=False, check_dtype=False)
+
+
+def test_build_event_state_file_batching_matches_full_mode(tmp_path: Path) -> None:
+    output_dir = tmp_path / "data" / "processed"
+    output_dir.mkdir(parents=True)
+
+    event_slug_a = "btc-updown-5m-1775579100"
+    event_slug_b = "btc-updown-5m-1775579400"
+    start_a = datetime.fromtimestamp(1775579100, tz=timezone.utc)
+    start_b = datetime.fromtimestamp(1775579400, tz=timezone.utc)
+
+    market_state_rows = [
+        {
+            **_orderbook_row(start_a + timedelta(seconds=1), event_slug_a, "Up", "tok_up_a", 0.50, 0.51),
+            "spot_price": 100.5,
+            "reference_spot_price": 100.0,
+            "seconds_to_end": 299.0,
+            "market_implied_up_probability": 0.51,
+            "fundamental_up_probability": 0.52,
+            "latent_up_probability": 0.518,
+            "latent_logit_probability": 0.01,
+            "state_observation_variance": 0.02,
+            "micro_price": 0.5054,
+            "weighted_imbalance": 0.07,
+            "depth_slope": 12.0,
+            "tick_density": 0.8,
+            "book_velocity": 0.0,
+            "mid_price_velocity": 0.0,
+            "micro_price_velocity": 0.0,
+            "state_timestamp": (start_a + timedelta(seconds=1)).isoformat(),
+            "book_age_seconds": 0.0,
+            "spot_source": "binance_book_ticker",
+            "spot_product_id": "BTCUSDT",
+            "spot_exchange_time": (start_a + timedelta(seconds=1)).isoformat(),
+            "spot_bid": 100.49,
+            "spot_ask": 100.51,
+            "reference_source": "test",
+            "spot_return_since_reference": 0.005,
+            "volatility_per_sqrt_second": 0.001,
+        },
+        {
+            **_orderbook_row(start_a + timedelta(seconds=1), event_slug_a, "Down", "tok_down_a", 0.48, 0.49),
+            "spot_price": 100.5,
+            "reference_spot_price": 100.0,
+            "seconds_to_end": 299.0,
+            "market_implied_up_probability": 0.51,
+            "fundamental_up_probability": 0.52,
+            "latent_up_probability": 0.518,
+            "latent_logit_probability": 0.01,
+            "state_observation_variance": 0.02,
+            "micro_price": 0.4846,
+            "weighted_imbalance": -0.06,
+            "depth_slope": 11.0,
+            "tick_density": 0.75,
+            "book_velocity": 0.0,
+            "mid_price_velocity": 0.0,
+            "micro_price_velocity": 0.0,
+            "state_timestamp": (start_a + timedelta(seconds=1)).isoformat(),
+            "book_age_seconds": 0.0,
+            "spot_source": "binance_book_ticker",
+            "spot_product_id": "BTCUSDT",
+            "spot_exchange_time": (start_a + timedelta(seconds=1)).isoformat(),
+            "spot_bid": 100.49,
+            "spot_ask": 100.51,
+            "reference_source": "test",
+            "spot_return_since_reference": 0.005,
+            "volatility_per_sqrt_second": 0.001,
+        },
+        {
+            **_orderbook_row(start_b + timedelta(seconds=1), event_slug_b, "Up", "tok_up_b", 0.53, 0.54),
+            "spot_price": 101.0,
+            "reference_spot_price": 100.0,
+            "seconds_to_end": 299.0,
+            "market_implied_up_probability": 0.535,
+            "fundamental_up_probability": 0.54,
+            "latent_up_probability": 0.538,
+            "latent_logit_probability": 0.03,
+            "state_observation_variance": 0.021,
+            "micro_price": 0.5353,
+            "weighted_imbalance": 0.08,
+            "depth_slope": 13.0,
+            "tick_density": 0.82,
+            "book_velocity": 0.2,
+            "mid_price_velocity": 0.1,
+            "micro_price_velocity": 0.1,
+            "state_timestamp": (start_b + timedelta(seconds=1)).isoformat(),
+            "book_age_seconds": 0.0,
+            "spot_source": "binance_book_ticker",
+            "spot_product_id": "BTCUSDT",
+            "spot_exchange_time": (start_b + timedelta(seconds=1)).isoformat(),
+            "spot_bid": 100.99,
+            "spot_ask": 101.01,
+            "reference_source": "test",
+            "spot_return_since_reference": 0.01,
+            "volatility_per_sqrt_second": 0.0012,
+        },
+        {
+            **_orderbook_row(start_b + timedelta(seconds=1), event_slug_b, "Down", "tok_down_b", 0.45, 0.46),
+            "spot_price": 101.0,
+            "reference_spot_price": 100.0,
+            "seconds_to_end": 299.0,
+            "market_implied_up_probability": 0.535,
+            "fundamental_up_probability": 0.54,
+            "latent_up_probability": 0.538,
+            "latent_logit_probability": 0.03,
+            "state_observation_variance": 0.021,
+            "micro_price": 0.4547,
+            "weighted_imbalance": -0.07,
+            "depth_slope": 10.5,
+            "tick_density": 0.78,
+            "book_velocity": 0.18,
+            "mid_price_velocity": 0.09,
+            "micro_price_velocity": 0.09,
+            "state_timestamp": (start_b + timedelta(seconds=1)).isoformat(),
+            "book_age_seconds": 0.0,
+            "spot_source": "binance_book_ticker",
+            "spot_product_id": "BTCUSDT",
+            "spot_exchange_time": (start_b + timedelta(seconds=1)).isoformat(),
+            "spot_bid": 100.99,
+            "spot_ask": 101.01,
+            "reference_source": "test",
+            "spot_return_since_reference": 0.01,
+            "volatility_per_sqrt_second": 0.0012,
+        },
+    ]
+
+    pd.DataFrame(market_state_rows[:2]).to_parquet(
+        output_dir / "crypto_5m_market_state_20260428_094500.parquet",
+        index=False,
+    )
+    pd.DataFrame(market_state_rows[2:]).to_parquet(
+        output_dir / "crypto_5m_market_state_20260428_095000.parquet",
+        index=False,
+    )
+
+    market_state_glob = str(output_dir / "crypto_5m_market_state_*.parquet")
+    full_output_dir = tmp_path / "event_full_out"
+    file_output_dir = tmp_path / "event_file_out"
+
+    full_result = build_event_state(
+        market_state_glob=market_state_glob,
+        output_dir=str(full_output_dir),
+        batch_mode="full",
+        run_timestamp="full_test",
+    )
+    file_result = build_event_state(
+        market_state_glob=market_state_glob,
+        output_dir=str(file_output_dir),
+        batch_mode="file",
+        run_timestamp="file_test",
+    )
+
+    full_state = pd.read_parquet(full_result["output_path"]).sort_values(["event_slug", "collected_at"]).reset_index(drop=True)
+    file_state = pd.read_parquet(file_result["output_path"]).sort_values(["event_slug", "collected_at"]).reset_index(drop=True)
 
     pd.testing.assert_frame_equal(full_state, file_state, check_like=False, check_dtype=False)
