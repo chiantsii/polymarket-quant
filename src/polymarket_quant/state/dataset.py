@@ -6,6 +6,7 @@ import glob
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -168,7 +169,18 @@ def build_market_state_rows(
     prepared_orderbooks = prepare_orderbooks(orderbooks)
     if orderbook_levels is not None and not orderbook_levels.empty:
         prepared_levels = prepare_orderbook_levels(orderbook_levels)
+        logger.info(
+            "Building orderbook level features from %s level rows across %s snapshots",
+            len(prepared_levels),
+            prepared_levels[["event_slug", "collected_at", "token_id", "outcome_name"]].drop_duplicates().shape[0],
+        )
+        level_feature_started_at = perf_counter()
         level_features = build_orderbook_level_features(prepared_levels)
+        logger.info(
+            "Built %s orderbook level feature rows in %.2fs",
+            len(level_features),
+            perf_counter() - level_feature_started_at,
+        )
         if not level_features.empty:
             merge_keys = ["event_slug", "collected_at", "token_id", "outcome_name"]
             prepared_orderbooks = prepared_orderbooks.merge(level_features, on=merge_keys, how="left")
@@ -474,60 +486,123 @@ def build_orderbook_level_features(orderbook_levels: pd.DataFrame) -> pd.DataFra
         return pd.DataFrame()
 
     key_cols = ["event_slug", "collected_at", "token_id", "outcome_name"]
-    feature_rows: list[dict[str, Any]] = []
+    side_key_cols = key_cols + ["side"]
+    side_feature_rows: list[dict[str, Any]] = []
 
-    for key, group in orderbook_levels.groupby(key_cols, sort=False):
-        bids = group[group["side"] == "bid"].sort_values("level")
-        asks = group[group["side"] == "ask"].sort_values("level")
+    # `prepare_orderbook_levels(...)` already sorts by timestamp/token/side/level,
+    # so we can reuse that order and avoid re-sorting each grouped slice.
+    for side_key, group in orderbook_levels.groupby(side_key_cols, sort=False):
+        top = group.head(5)
+        levels = pd.to_numeric(top["level"], errors="coerce").to_numpy(dtype=float)
+        prices = pd.to_numeric(top["price"], errors="coerce").to_numpy(dtype=float)
+        sizes = pd.to_numeric(top["size"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
-        best_bid = _first_value(bids, "price")
-        best_ask = _first_value(asks, "price")
-        best_bid_size = _first_value(bids, "size")
-        best_ask_size = _first_value(asks, "size")
-        mid_price = _mid_from_quotes(best_bid, best_ask)
-        micro_price = _micro_price(best_bid, best_ask, best_bid_size, best_ask_size)
+        best_price = float(prices[0]) if len(prices) > 0 and np.isfinite(prices[0]) else np.nan
+        best_size = float(sizes[0]) if len(sizes) > 0 and np.isfinite(sizes[0]) else np.nan
 
-        weighted_bid_depth = _weighted_depth(bids)
-        weighted_ask_depth = _weighted_depth(asks)
-        weighted_total = weighted_bid_depth + weighted_ask_depth
-        weighted_imbalance = (
-            (weighted_bid_depth - weighted_ask_depth) / weighted_total
-            if weighted_total > 0
-            else np.nan
-        )
-
-        bid_depth_slope = _cumulative_depth_slope(bids)
-        ask_depth_slope = _cumulative_depth_slope(asks)
-        depth_slope = np.nanmean([bid_depth_slope, ask_depth_slope])
-        if not np.isfinite(depth_slope):
-            depth_slope = np.nan
-
-        bid_tick_density = _price_tick_density(bids)
-        ask_tick_density = _price_tick_density(asks)
-        tick_density = np.nanmin([bid_tick_density, ask_tick_density])
-        if not np.isfinite(tick_density):
-            tick_density = np.nan
-
-        feature_rows.append(
+        side_feature_rows.append(
             {
-                "event_slug": key[0],
-                "collected_at": key[1],
-                "token_id": key[2],
-                "outcome_name": key[3],
-                "best_bid_size": best_bid_size,
-                "best_ask_size": best_ask_size,
-                "micro_price": micro_price,
-                "bid_depth_slope": bid_depth_slope,
-                "ask_depth_slope": ask_depth_slope,
-                "depth_slope": depth_slope,
-                "bid_tick_density": bid_tick_density,
-                "ask_tick_density": ask_tick_density,
-                "tick_density": tick_density,
-                "weighted_imbalance": weighted_imbalance,
+                "event_slug": side_key[0],
+                "collected_at": side_key[1],
+                "token_id": side_key[2],
+                "outcome_name": side_key[3],
+                "side": side_key[4],
+                "best_price": best_price,
+                "best_size": best_size,
+                "weighted_depth": _weighted_depth_from_arrays(levels, sizes),
+                "depth_slope": _cumulative_depth_slope_from_arrays(levels, sizes),
+                "tick_density": _price_tick_density_from_arrays(prices),
             }
         )
 
-    return pd.DataFrame(feature_rows)
+    if not side_feature_rows:
+        return pd.DataFrame()
+
+    side_features = pd.DataFrame(side_feature_rows)
+    bid_features = (
+        side_features[side_features["side"] == "bid"]
+        .drop(columns=["side"])
+        .rename(
+            columns={
+                "best_price": "best_bid",
+                "best_size": "best_bid_size",
+                "weighted_depth": "weighted_bid_depth",
+                "depth_slope": "bid_depth_slope",
+                "tick_density": "bid_tick_density",
+            }
+        )
+    )
+    ask_features = (
+        side_features[side_features["side"] == "ask"]
+        .drop(columns=["side"])
+        .rename(
+            columns={
+                "best_price": "best_ask",
+                "best_size": "best_ask_size",
+                "weighted_depth": "weighted_ask_depth",
+                "depth_slope": "ask_depth_slope",
+                "tick_density": "ask_tick_density",
+            }
+        )
+    )
+
+    feature_frame = bid_features.merge(ask_features, on=key_cols, how="outer")
+    best_bid = _column_or_nan(feature_frame, "best_bid")
+    best_ask = _column_or_nan(feature_frame, "best_ask")
+    best_bid_size = _column_or_nan(feature_frame, "best_bid_size")
+    best_ask_size = _column_or_nan(feature_frame, "best_ask_size")
+
+    denominator = best_bid_size + best_ask_size
+    weighted_micro = (best_ask * best_bid_size + best_bid * best_ask_size) / denominator
+    quote_mid = np.where(
+        best_bid.notna() & best_ask.notna(),
+        (best_bid + best_ask) / 2.0,
+        np.where(best_bid.notna(), best_bid, np.where(best_ask.notna(), best_ask, np.nan)),
+    )
+    feature_frame["micro_price"] = np.where(
+        best_bid.notna() & best_ask.notna() & best_bid_size.notna() & best_ask_size.notna() & (denominator > 0),
+        weighted_micro,
+        quote_mid,
+    )
+    weighted_total = feature_frame["weighted_bid_depth"].fillna(0.0) + feature_frame["weighted_ask_depth"].fillna(0.0)
+    feature_frame["weighted_imbalance"] = np.where(
+        weighted_total > 0.0,
+        (
+            feature_frame["weighted_bid_depth"].fillna(0.0)
+            - feature_frame["weighted_ask_depth"].fillna(0.0)
+        )
+        / weighted_total,
+        np.nan,
+    )
+    bid_slope = _column_or_nan(feature_frame, "bid_depth_slope")
+    ask_slope = _column_or_nan(feature_frame, "ask_depth_slope")
+    feature_frame["depth_slope"] = np.where(
+        bid_slope.notna() & ask_slope.notna(),
+        (bid_slope + ask_slope) / 2.0,
+        np.where(bid_slope.notna(), bid_slope, np.where(ask_slope.notna(), ask_slope, np.nan)),
+    )
+    bid_density = _column_or_nan(feature_frame, "bid_tick_density")
+    ask_density = _column_or_nan(feature_frame, "ask_tick_density")
+    feature_frame["tick_density"] = np.where(
+        bid_density.notna() & ask_density.notna(),
+        np.minimum(bid_density, ask_density),
+        np.where(bid_density.notna(), bid_density, np.where(ask_density.notna(), ask_density, np.nan)),
+    )
+    return feature_frame[
+        key_cols
+        + [
+            "best_bid_size",
+            "best_ask_size",
+            "micro_price",
+            "bid_depth_slope",
+            "ask_depth_slope",
+            "depth_slope",
+            "bid_tick_density",
+            "ask_tick_density",
+            "tick_density",
+            "weighted_imbalance",
+        ]
+    ].reset_index(drop=True)
 
 
 def spot_ticks_asof(
@@ -810,6 +885,20 @@ def _weighted_depth(rows: pd.DataFrame, top_n: int = 5) -> float:
         return 0.0
     weights = 1.0 / np.maximum(pd.to_numeric(top["level"], errors="coerce").to_numpy(dtype=float), 1.0)
     sizes = pd.to_numeric(top["size"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    return _weighted_depth_from_arrays(weights=weights, sizes=sizes, levels=None)
+
+
+def _weighted_depth_from_arrays(
+    levels: np.ndarray | None,
+    sizes: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    if sizes.size == 0:
+        return 0.0
+    if weights is None:
+        if levels is None or levels.size == 0:
+            return 0.0
+        weights = 1.0 / np.maximum(levels, 1.0)
     return float(np.sum(weights * sizes))
 
 
@@ -821,6 +910,20 @@ def _cumulative_depth_slope(rows: pd.DataFrame, top_n: int = 5) -> float:
         return np.nan
     levels = pd.to_numeric(top["level"], errors="coerce").to_numpy(dtype=float)
     cumulative = np.cumsum(pd.to_numeric(top["size"], errors="coerce").fillna(0.0).to_numpy(dtype=float))
+    return _cumulative_depth_slope_from_arrays(levels, cumulative=cumulative)
+
+
+def _cumulative_depth_slope_from_arrays(
+    levels: np.ndarray,
+    sizes: np.ndarray | None = None,
+    cumulative: np.ndarray | None = None,
+) -> float:
+    if levels.size < 2:
+        return np.nan
+    if cumulative is None:
+        if sizes is None or sizes.size < 2:
+            return np.nan
+        cumulative = np.cumsum(sizes)
     slope = np.polyfit(levels, cumulative, deg=1)[0]
     return float(slope) if np.isfinite(slope) else np.nan
 
@@ -830,16 +933,26 @@ def _price_tick_density(rows: pd.DataFrame, top_n: int = 5) -> float:
         return np.nan
     top = rows.nsmallest(top_n, "level")
     prices = pd.to_numeric(top["price"], errors="coerce").dropna().to_numpy(dtype=float)
-    if len(prices) <= 1:
-        return 1.0 if len(prices) == 1 else np.nan
+    return _price_tick_density_from_arrays(prices)
+
+
+def _price_tick_density_from_arrays(prices: np.ndarray) -> float:
+    if prices.size <= 1:
+        return 1.0 if prices.size == 1 else np.nan
     diffs = np.abs(np.diff(np.sort(prices)))
     diffs = diffs[diffs > 1e-12]
-    if len(diffs) == 0:
+    if diffs.size == 0:
         return 1.0
     min_tick = float(np.min(diffs))
     price_range = float(np.max(prices) - np.min(prices))
     expected_levels = max(int(round(price_range / min_tick)) + 1, 1)
-    return float(min(len(prices) / expected_levels, 1.0))
+    return float(min(prices.size / expected_levels, 1.0))
+
+
+def _column_or_nan(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce")
 
 
 def _group_velocity(rows: pd.DataFrame, group_cols: list[str], column: str) -> pd.Series:

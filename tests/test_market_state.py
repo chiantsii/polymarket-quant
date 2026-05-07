@@ -1,4 +1,5 @@
 import json
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from polymarket_quant.state import (
     load_orderbook_raw_glob,
     load_spot_raw_glob,
 )
-from polymarket_quant.state.dataset import filter_complete_event_windows
+from polymarket_quant.state.dataset import build_orderbook_level_features, filter_complete_event_windows
 
 
 def _orderbook_row(timestamp, event_slug: str, outcome_name: str, token_id: str, best_bid: float, best_ask: float):
@@ -218,6 +219,50 @@ def test_build_market_state_dataset_handles_single_sided_quotes_with_nan_mid_pri
     assert state["market_implied_up_probability"].notna().all()
     assert state["market_implied_up_probability"].between(0.0, 1.0).all()
     assert state["latent_up_probability"].notna().all()
+
+
+def test_build_orderbook_level_features_silences_all_nan_depth_slope_warning() -> None:
+    event_slug = "btc-updown-5m-1775578800"
+    start = datetime.fromtimestamp(1775578800, tz=timezone.utc)
+    ts_1 = start + timedelta(seconds=1)
+
+    orderbook_levels = pd.DataFrame(
+        [
+            {
+                "event_slug": event_slug,
+                "collected_at": ts_1.isoformat(),
+                "token_id": "tok_up",
+                "outcome_name": "Up",
+                "side": "bid",
+                "level": 1,
+                "price": 0.50,
+                "size": 60.0,
+            },
+            {
+                "event_slug": event_slug,
+                "collected_at": ts_1.isoformat(),
+                "token_id": "tok_up",
+                "outcome_name": "Up",
+                "side": "ask",
+                "level": 1,
+                "price": 0.51,
+                "size": 55.0,
+            },
+        ]
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        features = build_orderbook_level_features(orderbook_levels)
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == []
+    assert len(features) == 1
+    assert features["depth_slope"].isna().all()
 
 
 def test_load_orderbook_and_spot_raw_glob_builds_frames(tmp_path) -> None:
