@@ -7,6 +7,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from polymarket_quant.pricing import DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND
+from polymarket_quant.pricing import (
+    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
+    DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
+    DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
+    DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
+    DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+)
 from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
 from polymarket_quant.state.dataset import load_parquet_glob
 from polymarket_quant.utils.logger import get_logger
@@ -35,6 +43,12 @@ def _build_detector_config(
     *,
     pricing_method: str,
     n_samples: int,
+    spot_drift_decay_kappa_per_second: float,
+    spot_jump_intensity_per_second: float,
+    spot_jump_log_return_mean: float,
+    spot_jump_log_return_std: float,
+    spot_jump_std_multiplier_on_local_sigma: float,
+    force_manual_jump_parameters: bool,
     fallback_spot_volatility_per_sqrt_second: float,
     edge_threshold: float,
     simulation_dt_seconds: float,
@@ -45,6 +59,12 @@ def _build_detector_config(
     return MispricingDetectorConfig(
         pricing_method=pricing_method,
         n_samples=n_samples,
+        spot_drift_decay_kappa_per_second=spot_drift_decay_kappa_per_second,
+        spot_jump_intensity_per_second=spot_jump_intensity_per_second,
+        spot_jump_log_return_mean=spot_jump_log_return_mean,
+        spot_jump_log_return_std=spot_jump_log_return_std,
+        spot_jump_std_multiplier_on_local_sigma=spot_jump_std_multiplier_on_local_sigma,
+        force_manual_jump_parameters=force_manual_jump_parameters,
         fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
         simulation_dt_seconds=simulation_dt_seconds,
@@ -58,6 +78,12 @@ def replay_pricing(
     output_dir: str = "data/processed",
     pricing_method: str = "markov_mcmc",
     n_samples: int = 1_000,
+    spot_drift_decay_kappa_per_second: float = DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND,
+    spot_jump_intensity_per_second: float = DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
+    spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
+    spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
+    spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
     fallback_spot_volatility_per_sqrt_second: float = 0.0005,
     edge_threshold: float = 0.0,
     simulation_dt_seconds: float = 1.0,
@@ -89,6 +115,12 @@ def replay_pricing(
     detector_config = _build_detector_config(
         pricing_method=pricing_method,
         n_samples=n_samples,
+        spot_drift_decay_kappa_per_second=spot_drift_decay_kappa_per_second,
+        spot_jump_intensity_per_second=spot_jump_intensity_per_second,
+        spot_jump_log_return_mean=spot_jump_log_return_mean,
+        spot_jump_log_return_std=spot_jump_log_return_std,
+        spot_jump_std_multiplier_on_local_sigma=spot_jump_std_multiplier_on_local_sigma,
+        force_manual_jump_parameters=force_manual_jump_parameters,
         fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
         simulation_dt_seconds=simulation_dt_seconds,
@@ -207,6 +239,51 @@ def main() -> None:
     )
     parser.add_argument("--n-samples", type=int, default=1_000, help="Simulation paths for pricing methods that require them")
     parser.add_argument(
+        "--spot-drift-decay-kappa-per-second",
+        type=float,
+        default=float(DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND),
+        help="Exponential decay rate applied to the learned spot drift during rollout. Default is a 5-second half-life.",
+    )
+    parser.add_argument(
+        "--spot-jump-intensity-per-second",
+        type=float,
+        default=float(DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND),
+        help="Manual jump intensity per second. Default is the selected 50/day zero-mean jump prior.",
+    )
+    parser.add_argument(
+        "--spot-jump-log-return-mean",
+        type=float,
+        default=float(DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN),
+        help="Manual jump log-return mean. Default keeps the jump prior zero-mean.",
+    )
+    parser.add_argument(
+        "--spot-jump-log-return-std",
+        type=float,
+        default=float(DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD),
+        help="Manual fixed jump log-return std. When the local-sigma multiplier is positive, this fixed std is ignored.",
+    )
+    parser.add_argument(
+        "--spot-jump-std-multiplier-on-local-sigma",
+        type=float,
+        default=float(DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA),
+        help=(
+            "Optional manual jump-std multiplier applied to each row's local spot volatility. "
+            "Default is the selected 20x local-sigma jump prior. When positive and manual jump parameters are enabled, replay uses "
+            "jump_std = multiplier * volatility_per_sqrt_second instead of the fixed jump std."
+        ),
+    )
+    parser.add_argument(
+        "--force-manual-jump-parameters",
+        action="store_true",
+        help="Ignore learned jump kernel outputs and force replay pricing to use the manual jump prior passed on the CLI.",
+    )
+    parser.add_argument(
+        "--use-learned-jump-parameters",
+        action="store_false",
+        dest="force_manual_jump_parameters",
+        help="Disable the default manual jump prior and fall back to learned jump kernel outputs when available.",
+    )
+    parser.add_argument(
         "--transition-model-path",
         default=DEFAULT_TRANSITION_MODEL_PATH,
         help="Transition model artifact used to learn state-conditioned spot-kernel parameters",
@@ -233,6 +310,7 @@ def main() -> None:
         help="Fallback spot volatility used when event_state is missing volatility_per_sqrt_second",
     )
     parser.add_argument("--include-latest", action="store_true", help="Include *_latest.parquet inputs")
+    parser.set_defaults(force_manual_jump_parameters=DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS)
     args = parser.parse_args()
 
     result = replay_pricing(
@@ -240,6 +318,12 @@ def main() -> None:
         output_dir=args.output_dir,
         pricing_method=args.pricing_method,
         n_samples=args.n_samples,
+        spot_drift_decay_kappa_per_second=args.spot_drift_decay_kappa_per_second,
+        spot_jump_intensity_per_second=args.spot_jump_intensity_per_second,
+        spot_jump_log_return_mean=args.spot_jump_log_return_mean,
+        spot_jump_log_return_std=args.spot_jump_log_return_std,
+        spot_jump_std_multiplier_on_local_sigma=args.spot_jump_std_multiplier_on_local_sigma,
+        force_manual_jump_parameters=args.force_manual_jump_parameters,
         edge_threshold=args.edge_threshold,
         simulation_dt_seconds=args.simulation_dt_seconds,
         rollout_horizon_seconds=args.rollout_horizon_seconds,

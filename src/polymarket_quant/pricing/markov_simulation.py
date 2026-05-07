@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
@@ -21,6 +22,12 @@ from polymarket_quant.state import TransitionModelBundle
 
 PricingModel = Callable[[np.ndarray], np.ndarray | float]
 ProgressCallback = Callable[[int], None]
+DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND = math.log(2.0) / 5.0
+DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND = 50.0 / 86400.0
+DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN = 0.0
+DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD = 0.0
+DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA = 20.0
+DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS = True
 
 
 @dataclass(frozen=True)
@@ -45,10 +52,13 @@ class MarkovSimulationParams:
     """Parameters for terminal-spot Monte Carlo pricing."""
 
     spot_log_drift_per_second: float = 0.0
+    spot_drift_decay_kappa_per_second: float = DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND
     base_spot_volatility_per_sqrt_second: float = 0.0005
-    spot_jump_intensity_per_second: float = 0.0
-    spot_jump_log_return_mean: float = 0.0
-    spot_jump_log_return_std: float = 0.0
+    spot_jump_intensity_per_second: float = DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND
+    spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN
+    spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD
+    spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
+    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
     simulation_dt_seconds: float = 1.0
     n_paths: int = 1_000
     liquidity_volatility_scale: float = 0.30
@@ -170,6 +180,7 @@ class MarkovSimulationEngine:
             market_state=market_state,
             spot_kernel=spot_kernel,
         )
+        drift_decay_kappa = float(max(self.params.spot_drift_decay_kappa_per_second, 0.0))
         conditioned_spot_volatility = self._conditioned_spot_diffusion(
             market_state=market_state,
             base_volatility=base_volatility,
@@ -180,7 +191,10 @@ class MarkovSimulationEngine:
             spot_kernel=spot_kernel,
         )
         conditioned_jump_mean = self._conditioned_jump_mean(spot_kernel)
-        conditioned_jump_std = self._conditioned_jump_std(spot_kernel)
+        conditioned_jump_std = self._conditioned_jump_std(
+            market_state=market_state,
+            spot_kernel=spot_kernel,
+        )
 
         diffusion_shocks = rng.standard_normal((self.params.n_paths, n_steps))
         if conditioned_spot_jump_intensity > 0.0 and conditioned_jump_std > 0.0:
@@ -196,8 +210,15 @@ class MarkovSimulationEngine:
             jump_sizes = np.zeros((self.params.n_paths, n_steps), dtype=float)
 
         log_initial_spot = float(np.log(initial_spot))
+        drift_increments = _drift_decay_increments(
+            mu_0=conditioned_spot_log_drift,
+            dt=dt,
+            n_steps=n_steps,
+            kappa=drift_decay_kappa,
+        )
         log_increments = (
-            (conditioned_spot_log_drift - 0.5 * conditioned_spot_volatility**2) * dt
+            drift_increments[None, :]
+            - 0.5 * conditioned_spot_volatility**2 * dt
             + conditioned_spot_volatility * np.sqrt(dt) * diffusion_shocks
             + jump_sizes
         )
@@ -220,6 +241,8 @@ class MarkovSimulationEngine:
                 "initial_spot_price": initial_spot,
                 "reference_spot_price": reference_price,
                 "conditioned_spot_log_drift_per_second": conditioned_spot_log_drift,
+                "spot_drift_decay_kappa_per_second": drift_decay_kappa,
+                "effective_accumulated_spot_drift_log_return": float(np.sum(drift_increments)),
                 "conditioned_spot_volatility_per_sqrt_second": conditioned_spot_volatility,
                 "conditioned_spot_jump_intensity_per_second": conditioned_spot_jump_intensity,
                 "conditioned_spot_jump_log_return_mean": conditioned_jump_mean,
@@ -353,31 +376,19 @@ class MarkovSimulationEngine:
         base_volatility: float,
         spot_kernel: dict[str, float] | None = None,
     ) -> float:
-        learned = _coerce_float(
-            None if spot_kernel is None else spot_kernel.get("sigma_hat_log_spot_ratio"),
-            default=market_state.learned_spot_volatility_per_sqrt_second,
-        )
-        if learned is not None and learned >= 0.0:
-            return float(learned)
-        vol_multiplier = max(float(market_state.spot_vol_multiplier), 0.25)
-        liquidity_depth = max(float(market_state.liquidity_depth), 0.0)
-        liquidity_penalty = 1.0 + (
-            self.params.liquidity_volatility_scale
-            / max(np.log1p(liquidity_depth), 1.0)
-        )
-        velocity_pressure = 1.0 + self.params.velocity_volatility_scale * abs(float(market_state.book_velocity))
-        variance_scale = (
-            vol_multiplier
-            * liquidity_penalty
-            * velocity_pressure
-        )
-        return float(max(base_volatility, 0.0) * np.sqrt(max(variance_scale, 1e-9)))
+        del market_state
+        del spot_kernel
+        return float(max(base_volatility, 0.0))
 
     def _conditioned_jump_intensity(
         self,
         market_state: SimulationMarketState,
         spot_kernel: dict[str, float] | None = None,
     ) -> float:
+        if self.params.force_manual_jump_parameters:
+            del market_state
+            del spot_kernel
+            return float(max(self.params.spot_jump_intensity_per_second, 0.0))
         learned = _coerce_float(
             None if spot_kernel is None else spot_kernel.get("lambda_hat_log_spot_ratio"),
             default=market_state.learned_spot_jump_intensity_per_second,
@@ -388,12 +399,26 @@ class MarkovSimulationEngine:
         return float(max(self.params.spot_jump_intensity_per_second, 0.0))
 
     def _conditioned_jump_mean(self, spot_kernel: dict[str, float] | None = None) -> float:
+        if self.params.force_manual_jump_parameters:
+            del spot_kernel
+            return float(self.params.spot_jump_log_return_mean)
         learned = _coerce_float(None if spot_kernel is None else spot_kernel.get("jump_mean_hat_log_spot_ratio"))
         if learned is not None:
             return float(learned)
         return float(self.params.spot_jump_log_return_mean)
 
-    def _conditioned_jump_std(self, spot_kernel: dict[str, float] | None = None) -> float:
+    def _conditioned_jump_std(
+        self,
+        *,
+        market_state: SimulationMarketState,
+        spot_kernel: dict[str, float] | None = None,
+    ) -> float:
+        if self.params.force_manual_jump_parameters:
+            del spot_kernel
+            multiplier = float(max(self.params.spot_jump_std_multiplier_on_local_sigma, 0.0))
+            if multiplier > 0.0:
+                return float(max(multiplier * max(market_state.spot_volatility_per_sqrt_second, 0.0), 0.0))
+            return float(max(self.params.spot_jump_log_return_std, 0.0))
         learned = _coerce_float(None if spot_kernel is None else spot_kernel.get("jump_std_hat_log_spot_ratio"))
         if learned is not None:
             return float(max(learned, 0.0))
@@ -429,6 +454,17 @@ def _apply_pricing_model(
     if priced_array.shape != probabilities.shape:
         raise ValueError("pricing_model must return a scalar or an array matching the input probability shape")
     return priced_array
+
+
+def _drift_decay_increments(*, mu_0: float, dt: float, n_steps: int, kappa: float) -> np.ndarray:
+    if n_steps <= 0:
+        return np.zeros(0, dtype=float)
+    if kappa <= 0.0:
+        return np.full(n_steps, float(mu_0) * float(dt), dtype=float)
+
+    step_starts = np.arange(n_steps, dtype=float) * float(dt)
+    step_ends = step_starts + float(dt)
+    return (float(mu_0) / float(kappa)) * (np.exp(-float(kappa) * step_starts) - np.exp(-float(kappa) * step_ends))
 
 
 def _coerce_float(value: Any, default: float | None = None) -> float | None:

@@ -2,8 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from scripts.replay_pricing import replay_pricing
+from polymarket_quant.pricing import (
+    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
+    DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
+    DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+)
 from polymarket_quant.state import (
     LatentMarkovStateBuilder,
     LatentMarkovStateConfig,
@@ -163,3 +169,33 @@ def test_replay_pricing_keeps_spot_terminal_payoff_mode_with_step_override(tmp_p
     replay = pd.read_parquet(output_dir / "crypto_5m_pricing_replay_rollout_test.parquet")
     assert set(replay["simulation_mode"]) == {"spot_terminal_binary_payoff_rollout"}
     assert set(replay["rollout_kernel"]) == {"spot_jump_diffusion"}
+
+
+def test_replay_pricing_defaults_to_selected_manual_jump_prior(tmp_path):
+    event_slug = "btc-updown-5m-1775578800"
+    start = datetime.fromtimestamp(1775578800, tz=timezone.utc)
+
+    input_dir = tmp_path / "inputs"
+    output_dir = tmp_path / "processed"
+    input_dir.mkdir()
+    _write_event_state_input(input_dir, event_slug=event_slug, start=start)
+
+    replay_pricing(
+        event_state_glob=str(input_dir / "crypto_5m_event_state_*.parquet"),
+        output_dir=str(output_dir),
+        n_samples=64,
+        transition_bundle=_StubTransitionBundle(),
+        run_timestamp="jump_default_test",
+    )
+
+    replay = pd.read_parquet(output_dir / "crypto_5m_pricing_replay_jump_default_test.parquet")
+    up = replay[replay["outcome_name"] == "Up"].reset_index(drop=True)
+
+    assert not up.empty
+    assert up["conditioned_spot_jump_intensity_per_second"].iloc[0] == pytest.approx(
+        DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND
+    )
+    assert up["conditioned_spot_jump_log_return_std"].iloc[0] == pytest.approx(
+        DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA * 0.0005
+    )
+    assert DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS is True

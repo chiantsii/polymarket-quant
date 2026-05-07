@@ -3,6 +3,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+from polymarket_quant.pricing import (
+    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
+    DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
+    DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+)
 from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
 
 
@@ -121,6 +126,16 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
     assert "net_buy_edge" not in up_valuation
     assert "inventory_penalty" not in up_valuation
     assert "risk_score" not in up_valuation
+
+
+def test_mispricing_detector_defaults_to_selected_manual_jump_prior() -> None:
+    detector = RealTimeMispricingDetector(MispricingDetectorConfig())
+
+    assert detector.config.force_manual_jump_parameters is DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
+    assert detector.config.spot_jump_intensity_per_second == pytest.approx(DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND)
+    assert detector.config.spot_jump_std_multiplier_on_local_sigma == pytest.approx(
+        DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
+    )
 
 
 def test_mispricing_detector_buy_signal_depends_on_edge_only(monkeypatch: pytest.MonkeyPatch) -> None:

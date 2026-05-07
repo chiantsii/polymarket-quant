@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 
 from polymarket_quant.pricing import (
+    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
+    DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
+    DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
+    DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
+    DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+    DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND,
     MarkovSimulationEngine,
     MarkovSimulationParams,
     SimulationMarketState,
@@ -30,13 +36,16 @@ class MispricingDetectorConfig:
 
     pricing_method: str = "markov_mcmc"
     spot_log_drift_per_second: float = 0.0
+    spot_drift_decay_kappa_per_second: float = DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND
     fallback_spot_volatility_per_sqrt_second: float = 0.0005
     n_samples: int = 1_000
     simulation_dt_seconds: float = 1.0
     rollout_horizon_seconds: float = 0.0
-    spot_jump_intensity_per_second: float = 0.01
-    spot_jump_log_return_mean: float = 0.0
-    spot_jump_log_return_std: float = 0.20
+    spot_jump_intensity_per_second: float = DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND
+    spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN
+    spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD
+    spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
+    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
     liquidity_volatility_scale: float = 0.30
     velocity_volatility_scale: float = 0.50
     edge_threshold: float = 0.0
@@ -59,10 +68,13 @@ class RealTimeMispricingDetector:
         self.engine = MarkovSimulationEngine(
             MarkovSimulationParams(
                 spot_log_drift_per_second=self.config.spot_log_drift_per_second,
+                spot_drift_decay_kappa_per_second=self.config.spot_drift_decay_kappa_per_second,
                 base_spot_volatility_per_sqrt_second=self.config.fallback_spot_volatility_per_sqrt_second,
                 spot_jump_intensity_per_second=self.config.spot_jump_intensity_per_second,
                 spot_jump_log_return_mean=self.config.spot_jump_log_return_mean,
                 spot_jump_log_return_std=self.config.spot_jump_log_return_std,
+                spot_jump_std_multiplier_on_local_sigma=self.config.spot_jump_std_multiplier_on_local_sigma,
+                force_manual_jump_parameters=self.config.force_manual_jump_parameters,
                 simulation_dt_seconds=self.config.simulation_dt_seconds,
                 n_paths=self.config.n_samples,
                 liquidity_volatility_scale=self.config.liquidity_volatility_scale,
@@ -220,6 +232,8 @@ class RealTimeMispricingDetector:
             "conditioned_spot_log_drift_per_second": simulation.diagnostics.get("conditioned_spot_log_drift_per_second"),
             "conditioned_spot_volatility_per_sqrt_second": simulation.diagnostics.get("conditioned_spot_volatility_per_sqrt_second"),
             "conditioned_spot_jump_intensity_per_second": simulation.diagnostics.get("conditioned_spot_jump_intensity_per_second"),
+            "conditioned_spot_jump_log_return_mean": simulation.diagnostics.get("conditioned_spot_jump_log_return_mean"),
+            "conditioned_spot_jump_log_return_std": simulation.diagnostics.get("conditioned_spot_jump_log_return_std"),
             "rollout_horizon_seconds": simulation.diagnostics.get("rollout_horizon_seconds"),
             "rollout_kernel": simulation.diagnostics.get("rollout_kernel"),
             "terminal_spot_mean": simulation.diagnostics.get("terminal_spot_mean"),
