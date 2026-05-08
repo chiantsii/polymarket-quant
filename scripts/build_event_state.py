@@ -1,10 +1,12 @@
 import argparse
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from polymarket_quant.state import build_event_state_dataset
 from polymarket_quant.state.dataset import load_parquet_glob, matching_parquet_paths
@@ -22,28 +24,31 @@ def build_event_state(
     include_latest: bool = False,
     run_timestamp: str | None = None,
 ) -> dict[str, str | int]:
-    if batch_mode == "full":
-        market_state = load_parquet_glob(market_state_glob, include_latest=include_latest)
-        event_state = build_event_state_dataset(market_state)
-    elif batch_mode == "file":
-        event_state = _build_event_state_file_batched(
-            market_state_glob=market_state_glob,
-            include_latest=include_latest,
-        )
-    else:
-        raise ValueError(f"Unsupported batch_mode: {batch_mode}")
-
     run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     parquet_path = output_path / f"crypto_5m_event_state_{run_timestamp}.parquet"
     latest_path = output_path / "crypto_5m_event_state_latest.parquet"
-    event_state.to_parquet(parquet_path, index=False)
-    event_state.to_parquet(latest_path, index=False)
 
-    logger.info("Saved %s event-state rows to %s", len(event_state), parquet_path)
+    if batch_mode == "full":
+        market_state = load_parquet_glob(market_state_glob, include_latest=include_latest)
+        event_state = build_event_state_dataset(market_state)
+        event_state.to_parquet(parquet_path, index=False)
+        event_state.to_parquet(latest_path, index=False)
+        rows = len(event_state)
+    elif batch_mode == "file":
+        rows = _build_event_state_file_batched(
+            market_state_glob=market_state_glob,
+            include_latest=include_latest,
+            parquet_path=parquet_path,
+            latest_path=latest_path,
+        )
+    else:
+        raise ValueError(f"Unsupported batch_mode: {batch_mode}")
+
+    logger.info("Saved %s event-state rows to %s", rows, parquet_path)
     return {
-        "rows": len(event_state),
+        "rows": rows,
         "output_path": str(parquet_path),
         "latest_path": str(latest_path),
     }
@@ -78,15 +83,25 @@ def _build_event_state_file_batched(
     *,
     market_state_glob: str,
     include_latest: bool,
-):
+    parquet_path: Path,
+    latest_path: Path,
+) -> int:
     market_state_paths = matching_parquet_paths(market_state_glob, include_latest=include_latest)
     if not market_state_paths:
         raise FileNotFoundError(f"No parquet files matched {market_state_glob}")
 
-    with TemporaryDirectory(prefix="event_state_batches_") as tmpdir:
-        temp_dir = Path(tmpdir)
-        event_state_batch_paths: list[Path] = []
+    total_started_at = perf_counter()
+    row_count = 0
+    batch_count = 0
+    writer: pq.ParquetWriter | None = None
+    arrow_schema: pa.Schema | None = None
 
+    if parquet_path.exists():
+        parquet_path.unlink()
+    if latest_path.exists():
+        latest_path.unlink()
+
+    try:
         for index, market_state_path in enumerate(market_state_paths, start=1):
             batch_started_at = perf_counter()
             logger.info(
@@ -106,33 +121,60 @@ def _build_event_state_file_batched(
                 continue
 
             event_state_batch = build_event_state_dataset(market_state)
-            batch_output_path = temp_dir / f"event_state_batch_{index:04d}.parquet"
-            event_state_batch.to_parquet(batch_output_path, index=False)
-            event_state_batch_paths.append(batch_output_path)
+            if event_state_batch.empty:
+                logger.info(
+                    "Skipping event-state batch %s/%s after transformation produced no rows: %s",
+                    index,
+                    len(market_state_paths),
+                    market_state_path.name,
+                )
+                continue
+
+            batch_table = pa.Table.from_pandas(event_state_batch, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(parquet_path, batch_table.schema)
+                arrow_schema = batch_table.schema
+                logger.info(
+                    "Initialized streamed event-state parquet writer at %s with %s columns",
+                    parquet_path,
+                    len(batch_table.schema.names),
+                )
+            else:
+                batch_table = pa.Table.from_pandas(
+                    event_state_batch.reindex(columns=arrow_schema.names),
+                    schema=arrow_schema,
+                    preserve_index=False,
+                )
+
+            writer.write_table(batch_table)
+            batch_rows = event_state_batch.shape[0]
+            row_count += batch_rows
+            batch_count += 1
             logger.info(
-                "Finished event-state file %s/%s: produced %s rows in %.2fs (spilled to %s)",
+                "Finished event-state file %s/%s: wrote %s rows in %.2fs (cumulative rows=%s, streamed batches=%s)",
                 index,
                 len(market_state_paths),
-                len(event_state_batch),
+                batch_rows,
                 perf_counter() - batch_started_at,
-                batch_output_path.name,
+                row_count,
+                batch_count,
             )
 
-        if not event_state_batch_paths:
+        if writer is None or row_count == 0:
             raise ValueError("No event-state rows were generated from file batches.")
+    finally:
+        if writer is not None:
+            writer.close()
 
-        logger.info("Concatenating %s event-state batch parquet file(s)", len(event_state_batch_paths))
-        concat_started_at = perf_counter()
-        event_state = pd.concat((pd.read_parquet(path) for path in event_state_batch_paths), ignore_index=True)
-        sort_cols = [column for column in ("event_slug", "collected_at") if column in event_state.columns]
-        if sort_cols:
-            event_state = event_state.sort_values(sort_cols).reset_index(drop=True)
-        logger.info(
-            "Concatenated %s event-state rows from temp parquet in %.2fs",
-            len(event_state),
-            perf_counter() - concat_started_at,
-        )
-        return event_state
+    shutil.copyfile(parquet_path, latest_path)
+    logger.info(
+        "Finished streamed event-state write: %s rows across %s batch(es) in %.2fs",
+        row_count,
+        batch_count,
+        perf_counter() - total_started_at,
+    )
+    logger.info("Copied latest event-state parquet to %s", latest_path)
+    return row_count
 
 
 if __name__ == "__main__":
