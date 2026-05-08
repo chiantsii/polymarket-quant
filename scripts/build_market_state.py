@@ -1,10 +1,13 @@
 import argparse
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from polymarket_quant.state import (
     LatentMarkovStateBuilder,
@@ -76,6 +79,12 @@ def build_market_state(
     run_timestamp: str | None = None,
 ) -> dict[str, str | int]:
     """Build market_state from processed orderbook and spot parquet only."""
+    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    parquet_path = output_path / f"crypto_5m_market_state_{run_timestamp}.parquet"
+    latest_path = output_path / "crypto_5m_market_state_latest.parquet"
+
     state_config = _build_state_config(
         event_duration_seconds=event_duration_seconds,
         fallback_volatility_per_sqrt_second=fallback_volatility_per_sqrt_second,
@@ -106,8 +115,11 @@ def build_market_state(
             spot_tolerance_seconds=spot_tolerance_seconds,
             event_duration_seconds=event_duration_seconds,
         )
+        state.to_parquet(parquet_path, index=False)
+        state.to_parquet(latest_path, index=False)
+        row_count = len(state)
     elif batch_mode == "file":
-        state = _build_market_state_file_batched(
+        row_count = _build_market_state_file_batched(
             orderbook_glob=orderbook_glob,
             orderbook_levels_glob=orderbook_levels_glob,
             spot_glob=spot_glob,
@@ -115,21 +127,15 @@ def build_market_state(
             spot_tolerance_seconds=spot_tolerance_seconds,
             event_duration_seconds=event_duration_seconds,
             include_latest=include_latest,
+            output_path=parquet_path,
         )
+        shutil.copyfile(parquet_path, latest_path)
     else:
         raise ValueError(f"Unsupported batch_mode: {batch_mode}")
 
-    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    parquet_path = output_path / f"crypto_5m_market_state_{run_timestamp}.parquet"
-    latest_path = output_path / "crypto_5m_market_state_latest.parquet"
-    state.to_parquet(parquet_path, index=False)
-    state.to_parquet(latest_path, index=False)
-
-    logger.info("Saved %s market-state rows to %s", len(state), parquet_path)
+    logger.info("Saved %s market-state rows to %s", row_count, parquet_path)
     return {
-        "rows": len(state),
+        "rows": row_count,
         "output_path": str(parquet_path),
         "latest_path": str(latest_path),
     }
@@ -144,7 +150,8 @@ def _build_market_state_file_batched(
     spot_tolerance_seconds: float,
     event_duration_seconds: float,
     include_latest: bool,
-) -> pd.DataFrame:
+    output_path: Path,
+) -> int:
     summary_paths = matching_parquet_paths(orderbook_glob, include_latest=include_latest)
     if not summary_paths:
         raise FileNotFoundError(f"No parquet files matched {orderbook_glob}")
@@ -243,21 +250,112 @@ def _build_market_state_file_batched(
         if not raw_state_batch_paths:
             raise ValueError("No market-state rows were generated from file batches.")
 
-        logger.info("Concatenating %s raw market-state batch parquet file(s)", len(raw_state_batch_paths))
-        concat_started_at = perf_counter()
-        raw_state = pd.concat((pd.read_parquet(path) for path in raw_state_batch_paths), ignore_index=True)
         logger.info(
-            "Concatenated %s raw rows from temp parquet in %.2fs; finalizing market-state features",
-            len(raw_state),
-            perf_counter() - concat_started_at,
+            "Finalizing %s raw market-state batch parquet file(s) into %s",
+            len(raw_state_batch_paths),
+            output_path,
         )
         finalize_started_at = perf_counter()
-        state = finalize_market_state_rows(
-            raw_state,
+        row_count = _finalize_market_state_batch_parquets(
+            raw_state_batch_paths=raw_state_batch_paths,
             fallback_volatility_per_sqrt_second=state_config.fallback_volatility_per_sqrt_second,
+            output_path=output_path,
         )
-        logger.info("Finalized %s market-state rows in %.2fs", len(state), perf_counter() - finalize_started_at)
-        return state
+        logger.info("Finalized %s market-state rows in %.2fs", row_count, perf_counter() - finalize_started_at)
+        return row_count
+
+
+def _finalize_market_state_batch_parquets(
+    *,
+    raw_state_batch_paths: list[Path],
+    fallback_volatility_per_sqrt_second: float,
+    output_path: Path,
+) -> int:
+    group_cols = ["event_slug", "token_id"]
+    sort_cols = ["event_slug", "token_id", "collected_at"]
+    carryover_by_group: dict[tuple[str, str], dict[str, object]] = {}
+    writer: pq.ParquetWriter | None = None
+    output_columns: list[str] | None = None
+    total_rows = 0
+
+    try:
+        for index, batch_path in enumerate(raw_state_batch_paths, start=1):
+            batch_started_at = perf_counter()
+            raw_batch = pd.read_parquet(batch_path)
+            if raw_batch.empty:
+                logger.info(
+                    "Skipping empty raw market-state batch %s/%s: %s",
+                    index,
+                    len(raw_state_batch_paths),
+                    batch_path.name,
+                )
+                continue
+
+            batch_group_keys = {
+                (str(event_slug), str(token_id))
+                for event_slug, token_id in raw_batch[group_cols].dropna().drop_duplicates().itertuples(index=False, name=None)
+            }
+            carryover_rows = [
+                carryover_by_group[group_key]
+                for group_key in batch_group_keys
+                if group_key in carryover_by_group
+            ]
+
+            carryover_frame = pd.DataFrame(carryover_rows) if carryover_rows else pd.DataFrame(columns=raw_batch.columns)
+            if not carryover_frame.empty:
+                carryover_frame["__carryover__"] = True
+            raw_batch = raw_batch.copy()
+            raw_batch["__carryover__"] = False
+
+            combined = (
+                pd.concat([carryover_frame, raw_batch], ignore_index=True, sort=False)
+                if not carryover_frame.empty
+                else raw_batch
+            )
+            finalized = finalize_market_state_rows(
+                combined,
+                fallback_volatility_per_sqrt_second=fallback_volatility_per_sqrt_second,
+            )
+
+            batch_output = finalized[~finalized["__carryover__"]].drop(columns=["__carryover__"]).reset_index(drop=True)
+            if output_columns is None:
+                output_columns = list(batch_output.columns)
+            else:
+                batch_output = batch_output.reindex(columns=output_columns)
+
+            if not batch_output.empty:
+                if writer is None:
+                    first_table = pa.Table.from_pandas(batch_output, preserve_index=False)
+                    writer = pq.ParquetWriter(output_path, first_table.schema)
+                    writer.write_table(first_table)
+                else:
+                    writer.write_table(pa.Table.from_pandas(batch_output, schema=writer.schema, preserve_index=False))
+                total_rows += len(batch_output)
+
+            latest_group_rows = (
+                combined.sort_values(sort_cols)
+                .groupby(group_cols, sort=False)
+                .tail(1)
+                .drop(columns=["__carryover__"])
+            )
+            for row in latest_group_rows.to_dict("records"):
+                group_key = (str(row["event_slug"]), str(row["token_id"]))
+                carryover_by_group[group_key] = row
+
+            logger.info(
+                "Finalized market-state batch %s/%s: wrote %s rows in %.2fs",
+                index,
+                len(raw_state_batch_paths),
+                len(batch_output),
+                perf_counter() - batch_started_at,
+            )
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if total_rows == 0:
+        raise ValueError("No finalized market-state rows were produced from raw batches.")
+    return total_rows
 
 
 def _prepare_batching_metadata(
