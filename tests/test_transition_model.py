@@ -166,33 +166,48 @@ def test_fit_transition_model_returns_structured_predictions() -> None:
     assert "diffusion_hat_latent_logit_probability" in predictions.columns
     assert "future_hat_latent_logit_probability" in predictions.columns
     assert "future_hat_latent_up_probability" in predictions.columns
-    assert "mu_hat_latent_logit_probability" in predictions.columns
-    assert "sigma_hat_latent_logit_probability" in predictions.columns
-    assert "lambda_hat_latent_logit_probability" in predictions.columns
     assert "mu_hat_log_spot_ratio" in predictions.columns
     assert "sigma_hat_log_spot_ratio" in predictions.columns
-    assert "lambda_hat_log_spot_ratio" in predictions.columns
-    assert "jump_probability_hat_latent_logit_probability" in predictions.columns
+    assert "lambda_hat_log_spot_ratio" not in predictions.columns
+    assert "jump_probability_hat_log_spot_ratio" not in predictions.columns
     assert "future_hat_regime_normal_posterior" in predictions.columns
-    assert "jump_intensity_hat" in predictions.columns
-    assert predictions["jump_intensity_hat"].between(0.0, 1.0).all()
-    assert predictions["jump_probability_hat_latent_logit_probability"].between(0.0, 1.0).all()
-    assert (predictions["sigma_hat_latent_logit_probability"] > 0.0).all()
-    assert (predictions["lambda_hat_latent_logit_probability"] >= 0.0).all()
+    assert "jump_intensity_hat" not in predictions.columns
     assert predictions["future_hat_latent_up_probability"].between(0.0, 1.0).all()
     assert fit_result.summary["training_rows"] == len(transition_targets)
     assert fit_result.summary["default_step_seconds"] == pytest.approx(15.0)
-    assert "rollout_feature_columns" in fit_result.summary
-    assert "current_latent_logit_probability" in fit_result.summary["rollout_feature_columns"]
-    assert "current_market_implied_up_probability" not in fit_result.summary["rollout_feature_columns"]
-    assert "parametric_latent_kernel" in fit_result.summary
     assert "parametric_spot_kernel" in fit_result.summary
-    assert fit_result.summary["parametric_latent_kernel"]["target"] == "latent_logit_probability"
     assert fit_result.summary["parametric_spot_kernel"]["target"] == "log_spot_ratio"
-    assert "mu_hat_latent_logit_probability" in fit_result.summary["parametric_latent_kernel"]["kernel_columns"]
     assert "mu_hat_log_spot_ratio" in fit_result.summary["parametric_spot_kernel"]["kernel_columns"]
-    assert fit_result.summary["parametric_latent_kernel"]["step_seconds_median"] == pytest.approx(15.0)
+    assert "lambda_hat_log_spot_ratio" not in fit_result.summary["parametric_spot_kernel"]["kernel_columns"]
     assert "latent_logit_probability" in fit_result.summary["target_metrics"]
+    assert "jump_event_rate" not in fit_result.summary
+
+
+def test_spot_sigma_head_is_not_forced_to_sqrt_floor() -> None:
+    transition_targets = _synthetic_transition_targets()
+    config = TransitionModelConfig(min_training_rows=32, random_state=7)
+    fit_result = fit_transition_model(transition_targets, config=config)
+
+    sigma_hat = fit_result.predictions["sigma_hat_log_spot_ratio"]
+    floor_sigma = config.diffusion_variance_floor ** 0.5
+
+    assert sigma_hat.nunique() > 1
+    assert float(sigma_hat.median()) < float(floor_sigma)
+
+
+def test_spot_kernel_predictions_only_emit_drift_and_sigma_heads() -> None:
+    transition_targets = _synthetic_transition_targets()
+    fit_result = fit_transition_model(
+        transition_targets,
+        config=TransitionModelConfig(min_training_rows=32, random_state=7),
+    )
+
+    predictions = fit_result.predictions
+    assert "mu_hat_log_spot_ratio" in predictions.columns
+    assert "sigma_hat_log_spot_ratio" in predictions.columns
+    assert "lambda_hat_log_spot_ratio" not in predictions.columns
+    assert "jump_mean_hat_log_spot_ratio" not in predictions.columns
+    assert "jump_std_hat_log_spot_ratio" not in predictions.columns
 
 
 def test_fit_transition_model_artifacts_writes_outputs(tmp_path) -> None:

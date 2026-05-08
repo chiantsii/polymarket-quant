@@ -160,8 +160,6 @@ def test_build_transition_target_dataset_pairs_current_and_future_state() -> Non
     assert first["future_cross_book_basis"] == pytest.approx(-0.01)
     assert first["target_delta_up_micro_price"] == pytest.approx(0.03)
     assert first["future_normalized_time_to_end"] == 0.95
-
-
 def test_build_transition_target_dataset_can_keep_unmatched_rows() -> None:
     start = datetime(2026, 4, 11, 10, 0, 0, tzinfo=timezone.utc)
     event_slug = "btc-updown-5m-1775578800"
