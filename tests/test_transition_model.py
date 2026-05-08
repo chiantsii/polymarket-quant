@@ -222,9 +222,37 @@ def test_fit_transition_model_artifacts_writes_outputs(tmp_path) -> None:
         include_latest=True,
         min_training_rows=32,
         random_state=11,
+        split_by_asset=False,
     )
 
     assert (tmp_path / "artifacts" / "transition_model_latest.joblib").exists()
     assert (tmp_path / "artifacts" / "transition_model_summary_latest.json").exists()
     assert (tmp_path / "processed" / "crypto_5m_transition_predictions_latest.parquet").exists()
     assert result["training_rows"] == len(transition_targets)
+
+
+def test_fit_transition_model_artifacts_writes_split_asset_outputs(tmp_path) -> None:
+    btc_targets = _synthetic_transition_targets()
+    eth_targets = _synthetic_transition_targets().copy()
+    eth_targets["asset"] = "ETH"
+    eth_targets["event_slug"] = eth_targets["event_slug"].str.replace("btc-updown", "eth-updown", regex=False)
+    transition_targets = pd.concat([btc_targets, eth_targets], ignore_index=True)
+    input_path = tmp_path / "crypto_5m_transition_targets_latest.parquet"
+    transition_targets.to_parquet(input_path, index=False)
+
+    result = fit_transition_model_artifacts(
+        transition_target_glob=str(input_path),
+        output_dir=str(tmp_path / "artifacts"),
+        prediction_dir=str(tmp_path / "processed"),
+        include_latest=True,
+        min_training_rows=32,
+        random_state=11,
+        split_by_asset=True,
+    )
+
+    assert (tmp_path / "artifacts" / "transition_model_btc_latest.joblib").exists()
+    assert (tmp_path / "artifacts" / "transition_model_eth_latest.joblib").exists()
+    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_btc_latest.parquet").exists()
+    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_eth_latest.parquet").exists()
+    assert result["split_by_asset"] is True
+    assert set(result["assets"]) == {"BTC", "ETH"}

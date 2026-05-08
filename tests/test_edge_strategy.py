@@ -4,6 +4,9 @@ import pandas as pd
 import pytest
 
 from polymarket_quant.evaluation.edge_strategy import (
+    BaselineUpPaperTradingExecutor,
+    BaselineUpSignalEngine,
+    BaselineUpStrategyConfig,
     edge_strategy_summary,
     replay_baseline_up_strategy,
     replay_dynamic_buy_strategy,
@@ -271,3 +274,52 @@ def test_baseline_up_strategy_adds_pnl_decomposition_columns() -> None:
     assert episodes.loc[0, "execution_cost"] == pytest.approx(0.01)
     assert episodes.loc[0, "estimated_fee"] > 0
     assert episodes.loc[0, "net_pnl_with_fee"] < episodes.loc[0, "gross_pnl"]
+
+
+def test_baseline_up_signal_engine_tracks_confirmation_entry_and_exit() -> None:
+    rows = [
+        _baseline_row(0, buy_edge=0.031, best_ask=0.50, best_bid=0.49, fair_token_price=0.55, seconds_to_end=240),
+        _baseline_row(2, buy_edge=0.033, best_ask=0.51, best_bid=0.50, fair_token_price=0.55, seconds_to_end=238),
+        _baseline_row(4, buy_edge=0.020, best_ask=0.52, best_bid=0.51, fair_token_price=0.56, seconds_to_end=236),
+        _baseline_row(20, buy_edge=0.010, best_ask=0.52, best_bid=0.54, fair_token_price=0.53, seconds_to_end=220),
+    ]
+    engine = BaselineUpSignalEngine()
+
+    decisions = [engine.process_row(row) for row in rows]
+
+    assert decisions[0]["decision"] == "confirming"
+    assert decisions[0]["position_state"] == "CONFIRMING"
+    assert decisions[1]["decision"] == "signal_armed"
+    assert decisions[1]["position_state"] == "PENDING_EXECUTION"
+    assert decisions[2]["decision"] == "enter"
+    assert decisions[2]["position_state"] == "LONG"
+    assert decisions[3]["decision"] == "exit"
+    assert decisions[3]["position_state"] == "FLAT"
+    assert decisions[3]["exit_reason"] == "hold_edge_reversal"
+    assert decisions[3]["closed_episode"]["entry_time"] == rows[2]["collected_at"]
+
+
+def test_baseline_up_signal_engine_ignores_non_target_outcomes() -> None:
+    engine = BaselineUpSignalEngine()
+    result = engine.process_row(_baseline_row(0, outcome_name="Down", buy_edge=0.08, seconds_to_end=240))
+    assert result is None
+
+
+def test_baseline_up_paper_executor_emits_orders_and_trade() -> None:
+    rows = [
+        _baseline_row(0, buy_edge=0.031, best_ask=0.50, best_bid=0.49, fair_token_price=0.55, seconds_to_end=240),
+        _baseline_row(2, buy_edge=0.033, best_ask=0.51, best_bid=0.50, fair_token_price=0.55, seconds_to_end=238),
+        _baseline_row(4, buy_edge=0.020, best_ask=0.52, best_bid=0.51, fair_token_price=0.56, seconds_to_end=236),
+        _baseline_row(20, buy_edge=0.010, best_ask=0.52, best_bid=0.54, fair_token_price=0.53, seconds_to_end=220),
+    ]
+    executor = BaselineUpPaperTradingExecutor(BaselineUpStrategyConfig())
+
+    signal_events, order_events, trades = executor.process_rows(rows)
+
+    assert len(signal_events) == 4
+    assert len(order_events) == 2
+    assert order_events.loc[0, "side"] == "BUY"
+    assert order_events.loc[1, "side"] == "SELL"
+    assert order_events.loc[0, "status"] == "filled"
+    assert len(trades) == 1
+    assert trades.loc[0, "exit_reason"] == "hold_edge_reversal"

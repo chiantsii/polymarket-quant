@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 
 from polymarket_quant.pricing import (
-    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
     DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
@@ -45,7 +44,6 @@ class MispricingDetectorConfig:
     spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN
     spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
-    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
     liquidity_volatility_scale: float = 0.30
     velocity_volatility_scale: float = 0.50
     edge_threshold: float = 0.0
@@ -74,7 +72,6 @@ class RealTimeMispricingDetector:
                 spot_jump_log_return_mean=self.config.spot_jump_log_return_mean,
                 spot_jump_log_return_std=self.config.spot_jump_log_return_std,
                 spot_jump_std_multiplier_on_local_sigma=self.config.spot_jump_std_multiplier_on_local_sigma,
-                force_manual_jump_parameters=self.config.force_manual_jump_parameters,
                 simulation_dt_seconds=self.config.simulation_dt_seconds,
                 n_paths=self.config.n_samples,
                 liquidity_volatility_scale=self.config.liquidity_volatility_scale,
@@ -228,6 +225,7 @@ class RealTimeMispricingDetector:
             "pricing_n_samples": simulation.n_paths,
             "simulation_n_steps": simulation.diagnostics.get("n_steps"),
             "simulation_dt_seconds": simulation.diagnostics.get("dt_seconds"),
+            "simulation_step_seconds": simulation.diagnostics.get("simulation_step_seconds"),
             "simulation_mode": simulation.diagnostics.get("simulation_mode"),
             "conditioned_spot_log_drift_per_second": simulation.diagnostics.get("conditioned_spot_log_drift_per_second"),
             "conditioned_spot_volatility_per_sqrt_second": simulation.diagnostics.get("conditioned_spot_volatility_per_sqrt_second"),
@@ -522,3 +520,70 @@ class RealTimeMispricingDetector:
         if event_state.empty:
             return None
         return event_state.iloc[0].to_dict()
+
+
+def _row_asset_key(row: Dict[str, Any]) -> str | None:
+    asset = str(row.get("asset", "")).strip().upper()
+    if asset:
+        return asset
+    event_slug = str(row.get("event_slug", "")).strip().lower()
+    if event_slug.startswith("btc-"):
+        return "BTC"
+    if event_slug.startswith("eth-"):
+        return "ETH"
+    return None
+
+
+class AssetAwareMispricingDetector:
+    """Route state rows to per-asset pricing detectors."""
+
+    def __init__(
+        self,
+        detectors_by_asset: dict[str, RealTimeMispricingDetector],
+        *,
+        fallback_detector: RealTimeMispricingDetector | None = None,
+    ) -> None:
+        normalized = {
+            str(asset).strip().upper(): detector
+            for asset, detector in detectors_by_asset.items()
+            if detector is not None
+        }
+        if not normalized and fallback_detector is None:
+            raise ValueError("Need at least one asset-specific detector or a fallback detector")
+        self.detectors_by_asset = normalized
+        self.fallback_detector = fallback_detector
+
+    def detect(
+        self,
+        state_rows: Iterable[Dict[str, Any]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "Pricing replay",
+    ) -> List[Dict[str, Any]]:
+        rows = [row for row in state_rows if row]
+        if not rows:
+            return []
+
+        grouped_rows: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+        asset_order: list[str | None] = []
+        for row in rows:
+            asset_key = _row_asset_key(row)
+            if asset_key not in grouped_rows:
+                asset_order.append(asset_key)
+            grouped_rows[asset_key].append(row)
+
+        valuation_rows: list[dict[str, Any]] = []
+        for asset_key in asset_order:
+            detector = self.detectors_by_asset.get(str(asset_key).upper()) if asset_key is not None else None
+            detector = detector or self.fallback_detector
+            if detector is None:
+                raise ValueError(f"No pricing detector configured for asset {asset_key!r}")
+            valuation_rows.extend(
+                detector.detect(
+                    grouped_rows[asset_key],
+                    show_progress=show_progress,
+                    progress_description=f"{progress_description} [{asset_key or 'UNKNOWN'}]",
+                )
+            )
+
+        return valuation_rows

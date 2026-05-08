@@ -4,11 +4,14 @@ import numpy as np
 import pytest
 
 from polymarket_quant.pricing import (
-    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
     DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
     DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
 )
-from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
+from polymarket_quant.signals.mispricing import (
+    AssetAwareMispricingDetector,
+    MispricingDetectorConfig,
+    RealTimeMispricingDetector,
+)
 
 
 def _state_row(
@@ -131,7 +134,6 @@ def test_mispricing_detector_prices_paths_and_flags_underpriced_up_token() -> No
 def test_mispricing_detector_defaults_to_selected_manual_jump_prior() -> None:
     detector = RealTimeMispricingDetector(MispricingDetectorConfig())
 
-    assert detector.config.force_manual_jump_parameters is DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
     assert detector.config.spot_jump_intensity_per_second == pytest.approx(DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND)
     assert detector.config.spot_jump_std_multiplier_on_local_sigma == pytest.approx(
         DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
@@ -159,6 +161,8 @@ def test_mispricing_detector_buy_signal_depends_on_edge_only(monkeypatch: pytest
         diagnostics = {
             "n_steps": 10,
             "dt_seconds": 1.0,
+            "simulation_step_seconds": 1.0,
+            "rollout_horizon_seconds": 10.0,
             "conditioned_spot_log_drift_per_second": 0.0,
             "conditioned_spot_volatility_per_sqrt_second": 0.2,
             "conditioned_spot_jump_intensity_per_second": 0.05,
@@ -257,3 +261,28 @@ def test_simulation_market_state_handles_missing_side_signals_without_warning() 
     assert state.book_velocity == 0.0
     assert state.spot_vol_multiplier == pytest.approx(1.0)
     assert state.spot_volatility_per_sqrt_second > 0.0
+
+
+def test_asset_aware_mispricing_detector_routes_rows_by_asset() -> None:
+    class _StubDetector:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def detect(self, rows, show_progress=False, progress_description="Pricing replay"):
+            return [{**row, "detector_tag": self.tag} for row in rows]
+
+    detector = AssetAwareMispricingDetector(
+        detectors_by_asset={
+            "BTC": _StubDetector("btc"),
+            "ETH": _StubDetector("eth"),
+        }
+    )
+
+    rows = [
+        {"asset": "BTC", "event_slug": "btc-updown-5m-a", "collected_at": "2026-05-08T10:00:00+00:00"},
+        {"asset": "ETH", "event_slug": "eth-updown-5m-a", "collected_at": "2026-05-08T10:00:00+00:00"},
+    ]
+    routed = detector.detect(rows)
+
+    assert routed[0]["detector_tag"] == "btc"
+    assert routed[1]["detector_tag"] == "eth"

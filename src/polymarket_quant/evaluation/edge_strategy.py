@@ -2,12 +2,327 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 DEFAULT_POLYMARKET_CRYPTO_TAKER_FEE_RATE = 0.07
+
+
+@dataclass(frozen=True)
+class BaselineUpStrategyConfig:
+    entry_edge_threshold: float = 0.03
+    entry_confirmation_snapshots: int = 2
+    min_entry_seconds_to_end: float = 120.0
+    max_entry_seconds_to_end: float = 300.0
+    no_new_entry_seconds_to_end: float = 60.0
+    max_holding_seconds: float = 60.0
+    max_edge_cap: float = 0.12
+    exit_hold_edge_threshold: float = 0.0
+    timestamp_col: str = "collected_at"
+    event_col: str = "event_slug"
+    outcome_col: str = "outcome_name"
+    fair_price_col: str = "fair_token_price"
+    buy_edge_col: str = "buy_edge"
+    hold_edge_col: str = "hold_edge"
+    bid_price_col: str = "best_bid"
+    ask_price_col: str = "best_ask"
+    entry_price_col: str = "best_ask"
+    exit_price_col: str = "best_bid"
+    seconds_to_end_col: str = "seconds_to_end"
+    target_outcome: str = "Up"
+    estimated_fee_rate: float = DEFAULT_POLYMARKET_CRYPTO_TAKER_FEE_RATE
+
+
+@dataclass
+class _BaselineEventRuntimeState:
+    confirmation_count: int = 0
+    pending_signal_row: dict[str, Any] | None = None
+    entry: dict[str, Any] | None = None
+
+
+class BaselineUpSignalEngine:
+    """Stateful baseline signal loop for incremental live rows."""
+
+    def __init__(self, config: BaselineUpStrategyConfig | None = None) -> None:
+        self.config = config or BaselineUpStrategyConfig()
+        self._event_states: dict[str, _BaselineEventRuntimeState] = {}
+        self._validate_config()
+
+    def process_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        current = _prepare_baseline_live_row(row, self.config)
+        if current is None:
+            return None
+
+        event_slug = str(current[self.config.event_col])
+        runtime = self._event_states.setdefault(event_slug, _BaselineEventRuntimeState())
+        decision = "observe"
+        exit_reason = None
+        closed_episode = None
+
+        if runtime.entry is None:
+            if runtime.pending_signal_row is not None:
+                if _finite(current.get(self.config.entry_price_col)):
+                    entry = current.copy()
+                    signal_row = runtime.pending_signal_row
+                    entry["_signal_confirmation_time"] = signal_row["_timestamp"]
+                    entry["_signal_confirmation_buy_edge"] = signal_row.get(self.config.buy_edge_col)
+                    entry["_signal_confirmation_seconds_to_end"] = signal_row.get(self.config.seconds_to_end_col)
+                    runtime.entry = entry
+                    runtime.pending_signal_row = None
+                    runtime.confirmation_count = 0
+                    decision = "enter"
+                else:
+                    runtime.pending_signal_row = None
+
+            if runtime.entry is None:
+                if _is_valid_baseline_entry(
+                    current=current,
+                    buy_edge_col=self.config.buy_edge_col,
+                    entry_price_col=self.config.entry_price_col,
+                    seconds_to_end_col=self.config.seconds_to_end_col,
+                    entry_edge_threshold=self.config.entry_edge_threshold,
+                    min_entry_seconds_to_end=self.config.min_entry_seconds_to_end,
+                    max_entry_seconds_to_end=self.config.max_entry_seconds_to_end,
+                    no_new_entry_seconds_to_end=self.config.no_new_entry_seconds_to_end,
+                    max_edge_cap=self.config.max_edge_cap,
+                ):
+                    runtime.confirmation_count += 1
+                    decision = "confirming"
+                else:
+                    runtime.confirmation_count = 0
+
+                if runtime.confirmation_count >= self.config.entry_confirmation_snapshots:
+                    runtime.pending_signal_row = current
+                    runtime.confirmation_count = 0
+                    decision = "signal_armed"
+        else:
+            holding_seconds = (current["_timestamp"] - runtime.entry["_timestamp"]).total_seconds()
+            exit_reason = _baseline_exit_reason(
+                current=current,
+                hold_edge_col=self.config.hold_edge_col,
+                seconds_to_end_col=self.config.seconds_to_end_col,
+                exit_hold_edge_threshold=self.config.exit_hold_edge_threshold,
+                holding_seconds=holding_seconds,
+                max_holding_seconds=self.config.max_holding_seconds,
+                no_new_entry_seconds_to_end=self.config.no_new_entry_seconds_to_end,
+            )
+            if exit_reason is not None:
+                decision = "exit"
+                closed_episode = _baseline_episode_row(
+                    entry=runtime.entry,
+                    exit_row=current,
+                    entry_price_col=self.config.entry_price_col,
+                    exit_price_col=self.config.exit_price_col,
+                    fair_price_col=self.config.fair_price_col,
+                    buy_edge_col=self.config.buy_edge_col,
+                    hold_edge_col=self.config.hold_edge_col,
+                    bid_price_col=self.config.bid_price_col,
+                    ask_price_col=self.config.ask_price_col,
+                    seconds_to_end_col=self.config.seconds_to_end_col,
+                    exit_reason=exit_reason,
+                    confirmation_snapshots=self.config.entry_confirmation_snapshots,
+                    estimated_fee_rate=self.config.estimated_fee_rate,
+                )
+                runtime.entry = None
+            else:
+                decision = "hold"
+
+        return {
+            "asset": current.get("asset"),
+            self.config.event_col: event_slug,
+            self.config.timestamp_col: current[self.config.timestamp_col],
+            self.config.outcome_col: current.get(self.config.outcome_col),
+            "decision": decision,
+            "exit_reason": exit_reason,
+            "position_state": self._position_state(runtime),
+            "has_position": runtime.entry is not None,
+            "confirmation_count": int(runtime.confirmation_count),
+            "pending_entry": runtime.pending_signal_row is not None,
+            "market_implied_up_probability": current.get("market_implied_up_probability"),
+            "latent_up_probability": current.get("latent_up_probability"),
+            "fair_up_probability": current.get("fair_up_probability"),
+            "fair_token_price": current.get(self.config.fair_price_col),
+            "buy_edge": current.get(self.config.buy_edge_col),
+            "hold_edge": current.get(self.config.hold_edge_col),
+            "sell_edge": current.get("sell_edge"),
+            "best_bid": current.get(self.config.bid_price_col),
+            "best_ask": current.get(self.config.ask_price_col),
+            "seconds_to_end": current.get(self.config.seconds_to_end_col),
+            "entry_time": runtime.entry["_timestamp"].isoformat() if runtime.entry is not None else None,
+            "entry_price": runtime.entry.get(self.config.entry_price_col) if runtime.entry is not None else np.nan,
+            "closed_episode": closed_episode,
+            "row": current,
+        }
+
+    def process_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
+        events = [event for row in rows if (event := self.process_row(row)) is not None]
+        return pd.DataFrame(events)
+
+    def snapshot_states(self) -> pd.DataFrame:
+        rows = []
+        for event_slug, runtime in self._event_states.items():
+            rows.append(
+                {
+                    self.config.event_col: event_slug,
+                    "position_state": self._position_state(runtime),
+                    "has_position": runtime.entry is not None,
+                    "confirmation_count": int(runtime.confirmation_count),
+                    "pending_entry": runtime.pending_signal_row is not None,
+                    "entry_time": runtime.entry["_timestamp"].isoformat() if runtime.entry is not None else None,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _position_state(self, runtime: _BaselineEventRuntimeState) -> str:
+        if runtime.entry is not None:
+            return "LONG"
+        if runtime.pending_signal_row is not None:
+            return "PENDING_EXECUTION"
+        if runtime.confirmation_count > 0:
+            return "CONFIRMING"
+        return "FLAT"
+
+    def _validate_config(self) -> None:
+        if self.config.entry_confirmation_snapshots <= 0:
+            raise ValueError("entry_confirmation_snapshots must be positive")
+        if self.config.max_holding_seconds <= 0:
+            raise ValueError("max_holding_seconds must be positive")
+        if self.config.min_entry_seconds_to_end < self.config.no_new_entry_seconds_to_end:
+            raise ValueError("min_entry_seconds_to_end must be >= no_new_entry_seconds_to_end")
+        if self.config.max_entry_seconds_to_end < self.config.min_entry_seconds_to_end:
+            raise ValueError("max_entry_seconds_to_end must be >= min_entry_seconds_to_end")
+        if self.config.max_edge_cap < self.config.entry_edge_threshold:
+            raise ValueError("max_edge_cap must be >= entry_edge_threshold")
+
+
+class BaselineUpPaperTradingExecutor:
+    """Stateful paper-trading wrapper around the baseline live signal engine."""
+
+    def __init__(self, config: BaselineUpStrategyConfig | None = None) -> None:
+        self.config = config or BaselineUpStrategyConfig()
+        self.engine = BaselineUpSignalEngine(self.config)
+        self._order_seq = 0
+
+    def process_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        signal_event = self.engine.process_row(row)
+        if signal_event is None:
+            return None
+
+        order_events: list[dict[str, Any]] = []
+        closed_trade = signal_event.get("closed_episode")
+        current = signal_event.get("row") or {}
+
+        if signal_event["decision"] == "enter":
+            order_events.append(
+                self._filled_order_event(
+                    row=current,
+                    side="BUY",
+                    reason="strategy_entry",
+                    price_col=self.config.entry_price_col,
+                )
+            )
+        elif signal_event["decision"] == "exit":
+            order_events.append(
+                self._filled_order_event(
+                    row=current,
+                    side="SELL",
+                    reason=str(signal_event.get("exit_reason") or "strategy_exit"),
+                    price_col=self.config.exit_price_col,
+                )
+            )
+
+        result = dict(signal_event)
+        result["order_events"] = order_events
+        result["closed_trade"] = closed_trade
+        return result
+
+    def process_rows(self, rows: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        signal_events: list[dict[str, Any]] = []
+        order_events: list[dict[str, Any]] = []
+        trades: list[dict[str, Any]] = []
+        for row in rows:
+            result = self.process_row(row)
+            if result is None:
+                continue
+            signal_events.append(_strip_live_payload(result))
+            order_events.extend(result.get("order_events", []))
+            if result.get("closed_trade") is not None:
+                trades.append(result["closed_trade"])
+        return pd.DataFrame(signal_events), pd.DataFrame(order_events), pd.DataFrame(trades)
+
+    def _filled_order_event(
+        self,
+        *,
+        row: dict[str, Any],
+        side: str,
+        reason: str,
+        price_col: str,
+    ) -> dict[str, Any]:
+        self._order_seq += 1
+        timestamp = row["_timestamp"].isoformat() if "_timestamp" in row else row.get(self.config.timestamp_col)
+        return {
+            "order_id": f"paper_order_{self._order_seq:06d}",
+            "asset": row.get("asset"),
+            "event_slug": row.get(self.config.event_col),
+            "token_id": row.get("token_id"),
+            "outcome_name": row.get(self.config.outcome_col),
+            "side": side,
+            "status": "filled",
+            "submitted_at": timestamp,
+            "filled_at": timestamp,
+            "price": row.get(price_col),
+            "quantity": 1.0,
+            "reason": reason,
+        }
+
+
+def _prepare_baseline_live_row(row: dict[str, Any], config: BaselineUpStrategyConfig) -> dict[str, Any] | None:
+    if not row:
+        return None
+    if str(row.get(config.outcome_col, "")).strip().lower() != str(config.target_outcome).strip().lower():
+        return None
+
+    prepared = dict(row)
+    required = {
+        config.timestamp_col,
+        config.event_col,
+        config.outcome_col,
+        config.fair_price_col,
+        config.buy_edge_col,
+        config.hold_edge_col,
+        config.bid_price_col,
+        config.ask_price_col,
+        config.entry_price_col,
+        config.exit_price_col,
+        config.seconds_to_end_col,
+    }
+    missing = required - set(prepared)
+    if missing:
+        raise ValueError(f"row is missing columns: {sorted(missing)}")
+
+    prepared["_timestamp"] = pd.to_datetime(prepared[config.timestamp_col], utc=True)
+    for column in [
+        config.fair_price_col,
+        config.buy_edge_col,
+        config.hold_edge_col,
+        config.entry_price_col,
+        config.exit_price_col,
+        config.bid_price_col,
+        config.ask_price_col,
+        config.seconds_to_end_col,
+    ]:
+        prepared[column] = _to_float(prepared.get(column), default=np.nan)
+    return prepared
+
+
+def _strip_live_payload(event: dict[str, Any]) -> dict[str, Any]:
+    clean = dict(event)
+    clean.pop("row", None)
+    clean.pop("closed_episode", None)
+    return clean
 
 
 def replay_baseline_up_strategy(
