@@ -245,12 +245,6 @@ def build_event_state_dataset(market_state: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Market-state data is missing columns: {sorted(missing)}")
 
-    prepared = market_state.copy()
-    prepared["_outcome_key"] = prepared["outcome_name"].astype(str).str.strip().str.lower()
-    prepared = prepared[prepared["_outcome_key"].isin({"up", "down"})].copy()
-    if prepared.empty:
-        raise ValueError("Market-state data does not contain Up/Down outcome rows")
-
     key_cols = ["event_slug", "collected_at"]
     shared_cols = [
         "series_slug",
@@ -320,20 +314,39 @@ def build_event_state_dataset(market_state: pd.DataFrame) -> pd.DataFrame:
         "mid_price_velocity",
         "micro_price_velocity",
     ]
+    selected_columns = [
+        column
+        for column in (key_cols + ["outcome_name"] + shared_cols + side_cols)
+        if column in market_state.columns
+    ]
+    prepared = market_state.loc[:, selected_columns].copy()
+    prepared["_outcome_key"] = prepared["outcome_name"].astype(str).str.strip().str.lower()
+    prepared = prepared.loc[prepared["_outcome_key"].isin({"up", "down"})].copy()
+    if prepared.empty:
+        raise ValueError("Market-state data does not contain Up/Down outcome rows")
 
     shared_cols = [column for column in shared_cols if column in prepared.columns]
     side_cols = [column for column in side_cols if column in prepared.columns]
+    prepared = prepared.sort_values(key_cols + ["_outcome_key"]).reset_index(drop=True)
+    dedup = prepared.drop_duplicates(subset=key_cols + ["_outcome_key"], keep="last")
 
     base = (
-        prepared.sort_values(key_cols + ["_outcome_key"])
-        .drop_duplicates(subset=key_cols, keep="last")[key_cols + shared_cols]
+        dedup.drop_duplicates(subset=key_cols, keep="last")[key_cols + shared_cols]
         .reset_index(drop=True)
     )
+    if side_cols:
+        side_wide = (
+            dedup[key_cols + ["_outcome_key"] + side_cols]
+            .set_index(key_cols + ["_outcome_key"])[side_cols]
+            .unstack("_outcome_key")
+        )
+        side_wide.columns = [f"{outcome}_{column}" for column, outcome in side_wide.columns]
+        ordered_side_columns = [f"{outcome}_{column}" for outcome in ("up", "down") for column in side_cols]
+        side_wide = side_wide.reindex(columns=ordered_side_columns).reset_index()
+    else:
+        side_wide = pd.DataFrame(columns=key_cols)
 
-    up = _prefixed_side_frame(prepared, outcome_key="up", key_cols=key_cols, side_cols=side_cols, prefix="up")
-    down = _prefixed_side_frame(prepared, outcome_key="down", key_cols=key_cols, side_cols=side_cols, prefix="down")
-
-    event_state = base.merge(up, on=key_cols, how="left").merge(down, on=key_cols, how="left")
+    event_state = base.merge(side_wide, on=key_cols, how="left", sort=False)
     event_state["has_up_book"] = event_state["up_token_id"].notna() if "up_token_id" in event_state.columns else False
     event_state["has_down_book"] = event_state["down_token_id"].notna() if "down_token_id" in event_state.columns else False
     event_state["has_full_book_pair"] = event_state["has_up_book"] & event_state["has_down_book"]

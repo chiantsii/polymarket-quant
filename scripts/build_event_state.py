@@ -120,6 +120,13 @@ def _build_event_state_file_batched(
                 )
                 continue
 
+            logger.info(
+                "Loaded market_state file %s/%s: %s rows, %s columns. Building event-state rows...",
+                index,
+                len(market_state_paths),
+                len(market_state),
+                len(market_state.columns),
+            )
             event_state_batch = build_event_state_dataset(market_state)
             if event_state_batch.empty:
                 logger.info(
