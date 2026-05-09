@@ -834,6 +834,10 @@ def test_build_market_state_file_batching_matches_full_mode(tmp_path: Path) -> N
     file_state = pd.read_parquet(file_result["output_path"]).sort_values(["event_slug", "token_id", "collected_at"]).reset_index(drop=True)
 
     pd.testing.assert_frame_equal(full_state, file_state, check_like=False, check_dtype=False)
+    assert Path(full_result["latest_path"]).exists()
+    assert Path(file_result["latest_path"]).exists()
+    assert (Path(full_result["shard_dir"]) / f"{slug_b}.parquet").exists()
+    assert (Path(file_result["shard_dir"]) / f"{slug_c}.parquet").exists()
 
 
 def test_build_event_state_file_batching_matches_full_mode(tmp_path: Path) -> None:
@@ -990,3 +994,7 @@ def test_build_event_state_file_batching_matches_full_mode(tmp_path: Path) -> No
     file_state = pd.read_parquet(file_result["output_path"]).sort_values(["event_slug", "collected_at"]).reset_index(drop=True)
 
     pd.testing.assert_frame_equal(full_state, file_state, check_like=False, check_dtype=False)
+    assert Path(full_result["latest_path"]).exists()
+    assert Path(file_result["latest_path"]).exists()
+    assert (Path(full_result["shard_dir"]) / f"{event_slug_a}.parquet").exists()
+    assert (Path(file_result["shard_dir"]) / f"{event_slug_b}.parquet").exists()
