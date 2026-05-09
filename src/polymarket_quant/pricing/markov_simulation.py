@@ -27,7 +27,7 @@ DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND = 50.0 / 86400.0
 DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN = 0.0
 DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD = 0.0
 DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA = 20.0
-DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS = True
+DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND = 2.0e-5
 
 
 @dataclass(frozen=True)
@@ -42,9 +42,6 @@ class SimulationMarketState:
     spot_vol_multiplier: float = 1.0
     learned_spot_log_drift_per_second: float | None = None
     learned_spot_volatility_per_sqrt_second: float | None = None
-    learned_spot_jump_intensity_per_second: float | None = None
-    learned_spot_jump_log_return_mean: float | None = None
-    learned_spot_jump_log_return_std: float | None = None
 
 
 @dataclass(frozen=True)
@@ -58,12 +55,12 @@ class MarkovSimulationParams:
     spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN
     spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
-    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS
     simulation_dt_seconds: float = 1.0
     n_paths: int = 1_000
     liquidity_volatility_scale: float = 0.30
     velocity_volatility_scale: float = 0.50
     rollout_horizon_seconds: float = 0.0
+    min_effective_spot_volatility_per_sqrt_second: float = DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND
 
 
 @dataclass(frozen=True)
@@ -154,7 +151,7 @@ class MarkovSimulationEngine:
 
         if horizon_seconds == 0.0:
             terminal_values = np.full(self.params.n_paths, initial_spot, dtype=float)
-            terminal_payoffs = (terminal_values > reference_price).astype(float)
+            terminal_payoffs = (terminal_values >= reference_price).astype(float)
             return MarkovSimulationResult(
                 terminal_spot_values=terminal_values,
                 terminal_payoffs=terminal_payoffs,
@@ -164,8 +161,10 @@ class MarkovSimulationEngine:
                 diagnostics={
                     "n_steps": 0,
                     "dt_seconds": 0.0,
+                    "simulation_step_seconds": 0.0,
                     "simulation_mode": "spot_terminal_binary_payoff_rollout",
                     "rollout_kernel": "spot_jump_diffusion",
+                    "rollout_horizon_seconds": 0.0,
                     "initial_spot_price": initial_spot,
                     "reference_spot_price": reference_price,
                     "empirical_cdf_at_reference_price": float(np.mean(terminal_values <= reference_price)),
@@ -176,7 +175,7 @@ class MarkovSimulationEngine:
         dt = float(horizon_seconds / n_steps)
         rng = np.random.default_rng(seed)
 
-        conditioned_spot_log_drift = self._conditioned_spot_drift(
+        conditioned_spot_log_drift_raw = self._conditioned_spot_drift(
             market_state=market_state,
             spot_kernel=spot_kernel,
         )
@@ -191,8 +190,9 @@ class MarkovSimulationEngine:
             spot_kernel=spot_kernel,
         )
         conditioned_jump_mean = self._conditioned_jump_mean(spot_kernel)
+        conditioned_spot_log_drift = conditioned_spot_log_drift_raw
         conditioned_jump_std = self._conditioned_jump_std(
-            market_state=market_state,
+            local_sigma=conditioned_spot_volatility,
             spot_kernel=spot_kernel,
         )
 
@@ -225,7 +225,7 @@ class MarkovSimulationEngine:
         terminal_log_spot = log_initial_spot + np.sum(log_increments, axis=1)
         terminal_values = np.exp(terminal_log_spot)
         empirical_cdf_at_reference_price = float(np.mean(terminal_values <= reference_price))
-        terminal_payoffs = (terminal_values > reference_price).astype(float)
+        terminal_payoffs = (terminal_values >= reference_price).astype(float)
 
         return MarkovSimulationResult(
             terminal_spot_values=terminal_values,
@@ -240,14 +240,21 @@ class MarkovSimulationEngine:
                 "rollout_kernel": "spot_jump_diffusion",
                 "initial_spot_price": initial_spot,
                 "reference_spot_price": reference_price,
+                "raw_conditioned_spot_log_drift_per_second": conditioned_spot_log_drift_raw,
                 "conditioned_spot_log_drift_per_second": conditioned_spot_log_drift,
                 "spot_drift_decay_kappa_per_second": drift_decay_kappa,
                 "effective_accumulated_spot_drift_log_return": float(np.sum(drift_increments)),
+                "raw_conditioned_spot_volatility_per_sqrt_second": self._raw_conditioned_spot_diffusion(
+                    market_state=market_state,
+                    base_volatility=base_volatility,
+                    spot_kernel=spot_kernel,
+                ),
                 "conditioned_spot_volatility_per_sqrt_second": conditioned_spot_volatility,
                 "conditioned_spot_jump_intensity_per_second": conditioned_spot_jump_intensity,
                 "conditioned_spot_jump_log_return_mean": conditioned_jump_mean,
                 "conditioned_spot_jump_log_return_std": conditioned_jump_std,
-                "rollout_horizon_seconds": step_seconds,
+                "rollout_horizon_seconds": float(horizon_seconds),
+                "simulation_step_seconds": step_seconds,
                 "terminal_spot_mean": float(np.mean(terminal_values)),
                 "terminal_spot_std": float(np.std(terminal_values)),
                 "empirical_cdf_at_reference_price": empirical_cdf_at_reference_price,
@@ -376,8 +383,29 @@ class MarkovSimulationEngine:
         base_volatility: float,
         spot_kernel: dict[str, float] | None = None,
     ) -> float:
-        del market_state
-        del spot_kernel
+        raw = self._raw_conditioned_spot_diffusion(
+            market_state=market_state,
+            base_volatility=base_volatility,
+            spot_kernel=spot_kernel,
+        )
+        if raw <= 0.0:
+            return 0.0
+        floor = float(max(self.params.min_effective_spot_volatility_per_sqrt_second, 0.0))
+        return float(max(raw, floor))
+
+    def _raw_conditioned_spot_diffusion(
+        self,
+        *,
+        market_state: SimulationMarketState,
+        base_volatility: float,
+        spot_kernel: dict[str, float] | None = None,
+    ) -> float:
+        learned = _coerce_float(
+            None if spot_kernel is None else spot_kernel.get("sigma_hat_log_spot_ratio"),
+            default=market_state.learned_spot_volatility_per_sqrt_second,
+        )
+        if learned is not None:
+            return float(max(learned, 0.0))
         return float(max(base_volatility, 0.0))
 
     def _conditioned_jump_intensity(
@@ -385,43 +413,24 @@ class MarkovSimulationEngine:
         market_state: SimulationMarketState,
         spot_kernel: dict[str, float] | None = None,
     ) -> float:
-        if self.params.force_manual_jump_parameters:
-            del market_state
-            del spot_kernel
-            return float(max(self.params.spot_jump_intensity_per_second, 0.0))
-        learned = _coerce_float(
-            None if spot_kernel is None else spot_kernel.get("lambda_hat_log_spot_ratio"),
-            default=market_state.learned_spot_jump_intensity_per_second,
-        )
-        if learned is not None:
-            return float(max(learned, 0.0))
         del market_state
+        del spot_kernel
         return float(max(self.params.spot_jump_intensity_per_second, 0.0))
 
     def _conditioned_jump_mean(self, spot_kernel: dict[str, float] | None = None) -> float:
-        if self.params.force_manual_jump_parameters:
-            del spot_kernel
-            return float(self.params.spot_jump_log_return_mean)
-        learned = _coerce_float(None if spot_kernel is None else spot_kernel.get("jump_mean_hat_log_spot_ratio"))
-        if learned is not None:
-            return float(learned)
+        del spot_kernel
         return float(self.params.spot_jump_log_return_mean)
 
     def _conditioned_jump_std(
         self,
         *,
-        market_state: SimulationMarketState,
+        local_sigma: float,
         spot_kernel: dict[str, float] | None = None,
     ) -> float:
-        if self.params.force_manual_jump_parameters:
-            del spot_kernel
-            multiplier = float(max(self.params.spot_jump_std_multiplier_on_local_sigma, 0.0))
-            if multiplier > 0.0:
-                return float(max(multiplier * max(market_state.spot_volatility_per_sqrt_second, 0.0), 0.0))
-            return float(max(self.params.spot_jump_log_return_std, 0.0))
-        learned = _coerce_float(None if spot_kernel is None else spot_kernel.get("jump_std_hat_log_spot_ratio"))
-        if learned is not None:
-            return float(max(learned, 0.0))
+        del spot_kernel
+        multiplier = float(max(self.params.spot_jump_std_multiplier_on_local_sigma, 0.0))
+        if multiplier > 0.0:
+            return float(max(multiplier * max(local_sigma, 0.0), 0.0))
         return float(max(self.params.spot_jump_log_return_std, 0.0))
 
     def _predict_state_conditioned_spot_kernel(

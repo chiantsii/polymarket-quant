@@ -50,10 +50,17 @@ def run_live_signal_loop(
     simulation_dt_seconds: float = 1.0,
     rollout_horizon_seconds: float = 0.0,
     edge_threshold: float = 0.0,
+    open_cooldown_seconds: float = 30.0,
     entry_edge_threshold: float = 0.03,
     exit_hold_edge_threshold: float = 0.0,
-    max_holding_seconds: float = 60.0,
+    max_holding_seconds: float | None = None,
+    forced_exit_seconds_to_end: float | None = None,
     max_edge_cap: float = 0.12,
+    market_probability_exclusion_low: float | None = 0.40,
+    market_probability_exclusion_high: float | None = 0.60,
+    confident_exit_fair_probability_threshold: float = 0.86,
+    confident_exit_window_seconds: float = 60.0,
+    confident_exit_hold_edge_floor: float = -0.02,
 ) -> dict[str, Any]:
     detector = _build_detector(
         transition_model_path=transition_model_path,
@@ -66,10 +73,18 @@ def run_live_signal_loop(
     )
     engine = BaselineUpSignalEngine(
         BaselineUpStrategyConfig(
+            event_duration_seconds=float(event_duration_seconds),
+            open_cooldown_seconds=open_cooldown_seconds,
             entry_edge_threshold=entry_edge_threshold,
             exit_hold_edge_threshold=exit_hold_edge_threshold,
             max_holding_seconds=max_holding_seconds,
+            forced_exit_seconds_to_end=forced_exit_seconds_to_end,
             max_edge_cap=max_edge_cap,
+            market_probability_exclusion_low=market_probability_exclusion_low,
+            market_probability_exclusion_high=market_probability_exclusion_high,
+            confident_exit_fair_probability_threshold=confident_exit_fair_probability_threshold,
+            confident_exit_window_seconds=confident_exit_window_seconds,
+            confident_exit_hold_edge_floor=confident_exit_hold_edge_floor,
         )
     )
 
@@ -249,10 +264,17 @@ def main() -> None:
     parser.add_argument("--simulation-dt-seconds", type=float, default=1.0, help="Simulation dt in seconds")
     parser.add_argument("--rollout-horizon-seconds", type=float, default=0.0, help="Optional rollout step override")
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Detector buy-signal threshold")
+    parser.add_argument("--open-cooldown-seconds", type=float, default=30.0, help="Skip new entries during the first N seconds after market open")
     parser.add_argument("--entry-edge-threshold", type=float, default=0.03, help="Baseline strategy entry threshold")
     parser.add_argument("--exit-hold-edge-threshold", type=float, default=0.0, help="Baseline strategy exit hold-edge threshold")
-    parser.add_argument("--max-holding-seconds", type=float, default=60.0, help="Baseline strategy max holding time")
+    parser.add_argument("--max-holding-seconds", type=float, default=None, help="Optional baseline strategy max holding time; disabled by default")
+    parser.add_argument("--forced-exit-seconds-to-end", type=float, default=None, help="Optional forced exit time-to-end threshold; disabled by default")
     parser.add_argument("--max-edge-cap", type=float, default=0.12, help="Ignore oversized entry edges above this cap")
+    parser.add_argument("--market-probability-exclusion-low", type=float, default=0.40, help="Lower bound of market implied probability chop zone exclusion")
+    parser.add_argument("--market-probability-exclusion-high", type=float, default=0.60, help="Upper bound of market implied probability chop zone exclusion")
+    parser.add_argument("--confident-exit-fair-probability-threshold", type=float, default=0.86, help="Relax exit threshold when fair probability is above this level")
+    parser.add_argument("--confident-exit-window-seconds", type=float, default=60.0, help="Apply dynamic confident exit logic inside this time-to-end window")
+    parser.add_argument("--confident-exit-hold-edge-floor", type=float, default=-0.02, help="Most negative hold-edge threshold allowed near settlement for high-confidence states")
     args = parser.parse_args()
 
     run_live_signal_loop(
@@ -276,10 +298,17 @@ def main() -> None:
         simulation_dt_seconds=args.simulation_dt_seconds,
         rollout_horizon_seconds=args.rollout_horizon_seconds,
         edge_threshold=args.edge_threshold,
+        open_cooldown_seconds=args.open_cooldown_seconds,
         entry_edge_threshold=args.entry_edge_threshold,
         exit_hold_edge_threshold=args.exit_hold_edge_threshold,
         max_holding_seconds=args.max_holding_seconds,
+        forced_exit_seconds_to_end=args.forced_exit_seconds_to_end,
         max_edge_cap=args.max_edge_cap,
+        market_probability_exclusion_low=args.market_probability_exclusion_low,
+        market_probability_exclusion_high=args.market_probability_exclusion_high,
+        confident_exit_fair_probability_threshold=args.confident_exit_fair_probability_threshold,
+        confident_exit_window_seconds=args.confident_exit_window_seconds,
+        confident_exit_hold_edge_floor=args.confident_exit_hold_edge_floor,
     )
 
 

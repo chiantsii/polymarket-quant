@@ -55,10 +55,17 @@ class EmbeddedLiveRuntimeConfig:
     simulation_dt_seconds: float = 1.0
     rollout_horizon_seconds: float = 0.0
     edge_threshold: float = 0.0
+    open_cooldown_seconds: float = 30.0
     entry_edge_threshold: float = 0.03
     exit_hold_edge_threshold: float = 0.0
-    max_holding_seconds: float = 60.0
+    max_holding_seconds: float | None = None
+    forced_exit_seconds_to_end: float | None = None
     max_edge_cap: float = 0.12
+    market_probability_exclusion_low: float | None = 0.40
+    market_probability_exclusion_high: float | None = 0.60
+    confident_exit_fair_probability_threshold: float = 0.86
+    confident_exit_window_seconds: float = 60.0
+    confident_exit_hold_edge_floor: float = -0.02
     quiet_runtime_logs: bool = True
 
 
@@ -81,10 +88,18 @@ class EmbeddedLiveRuntime:
         self.detector = detector or _build_detector(config)
         self.executor = executor or BaselineUpPaperTradingExecutor(
             BaselineUpStrategyConfig(
+                event_duration_seconds=float(config.event_duration_seconds),
+                open_cooldown_seconds=config.open_cooldown_seconds,
                 entry_edge_threshold=config.entry_edge_threshold,
                 exit_hold_edge_threshold=config.exit_hold_edge_threshold,
                 max_holding_seconds=config.max_holding_seconds,
+                forced_exit_seconds_to_end=config.forced_exit_seconds_to_end,
                 max_edge_cap=config.max_edge_cap,
+                market_probability_exclusion_low=config.market_probability_exclusion_low,
+                market_probability_exclusion_high=config.market_probability_exclusion_high,
+                confident_exit_fair_probability_threshold=config.confident_exit_fair_probability_threshold,
+                confident_exit_window_seconds=config.confident_exit_window_seconds,
+                confident_exit_hold_edge_floor=config.confident_exit_hold_edge_floor,
             )
         )
 

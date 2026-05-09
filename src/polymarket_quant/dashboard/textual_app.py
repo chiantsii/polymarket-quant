@@ -28,7 +28,8 @@ class TextualDashboardConfig:
     paper_signal_path: str
     paper_order_path: str
     paper_trade_path: str
-    refresh_seconds: float = 2.0
+    refresh_seconds: float = 0.25
+    poll_seconds: float = 1.0
     max_points: int = 80
     max_rows: int = 12
     runtime: EmbeddedLiveRuntimeConfig | None = None
@@ -48,6 +49,8 @@ def run_textual_dashboard_app(config: TextualDashboardConfig) -> None:
 class PolymarketDashboardApp(App):  # pragma: no cover - UI runtime
     TITLE = "Polymarket Quant Terminal Board"
     SUB_TITLE = "State -> Fair -> Edge -> Paper Execution"
+    MIN_UI_REFRESH_SECONDS = 0.10
+    MIN_MARKET_POLL_SECONDS = 0.25
     CSS = """
     Screen {
         background: #05070c;
@@ -132,12 +135,19 @@ class PolymarketDashboardApp(App):  # pragma: no cover - UI runtime
         yield Footer()
 
     def on_mount(self) -> None:
-        self.set_interval(max(self.config.refresh_seconds, 1.0), self.refresh_dashboard)
+        if self.runtime is not None:
+            self.set_interval(_effective_market_poll_seconds(self.config.poll_seconds), self.poll_runtime)
+            self.poll_runtime()
+        self.set_interval(_effective_ui_refresh_seconds(self.config.refresh_seconds), self.refresh_dashboard)
         self.refresh_dashboard()
+
+    def poll_runtime(self) -> None:
+        if self.runtime is None:
+            return
+        self.runtime.poll_once()
 
     def refresh_dashboard(self) -> None:
         if self.runtime is not None:
-            self.runtime.poll_once()
             runtime_paths = self.runtime.snapshot_paths()
             event_state_path = runtime_paths["event_state_path"]
             live_signal_path = runtime_paths["live_signal_path"]
@@ -289,6 +299,17 @@ def _render_pnl_panel(snapshot: dict[str, Any]) -> str:
 
 
 def _render_probability_panel(snapshot: dict[str, Any]) -> str:
+    series_by_asset = snapshot.get("probability_series_by_asset", {})
+    lines: list[str] = []
+    for asset in ("BTC", "ETH"):
+        asset_series = series_by_asset.get(asset)
+        if not asset_series:
+            continue
+        lines.extend(_render_probability_asset_block(asset, asset_series))
+        lines.append("")
+    if lines:
+        return _panel("RECENT SIGNAL PROBABILITY TRAJECTORY", lines[:-1] if lines[-1] == "" else lines)
+
     series = snapshot.get("probability_series", {})
     market = _sparkline(series.get("market", []), minimum=0.0, maximum=1.0)
     latent = _sparkline(series.get("latent", []), minimum=0.0, maximum=1.0)
@@ -301,6 +322,18 @@ def _render_probability_panel(snapshot: dict[str, Any]) -> str:
             "[magenta]Fair  [/magenta] " + fair,
         ],
     )
+
+
+def _render_probability_asset_block(asset: str, series: dict[str, Any]) -> list[str]:
+    market = _sparkline(series.get("market", []), minimum=0.0, maximum=1.0)
+    latent = _sparkline(series.get("latent", []), minimum=0.0, maximum=1.0)
+    fair = _sparkline(series.get("fair", []), minimum=0.0, maximum=1.0)
+    return [
+        f"[bold #8ea0bd]{asset}[/bold #8ea0bd]",
+        "[cyan]Market[/cyan] " + market,
+        "[green]Latent[/green] " + latent,
+        "[magenta]Fair  [/magenta] " + fair,
+    ]
 
 
 def _render_curve_panel(snapshot: dict[str, Any]) -> str:
@@ -353,6 +386,14 @@ def _fmt_pct(value: Any) -> str:
 def _fmt_num(value: Any, digits: int) -> str:
     number = _to_float(value)
     return "-" if number is None else f"{number:.{digits}f}"
+
+
+def _effective_ui_refresh_seconds(refresh_seconds: float) -> float:
+    return max(float(refresh_seconds), PolymarketDashboardApp.MIN_UI_REFRESH_SECONDS)
+
+
+def _effective_market_poll_seconds(poll_seconds: float) -> float:
+    return max(float(poll_seconds), PolymarketDashboardApp.MIN_MARKET_POLL_SECONDS)
 
 
 def _to_float(value: Any) -> float | None:

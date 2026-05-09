@@ -13,18 +13,28 @@ DEFAULT_POLYMARKET_CRYPTO_TAKER_FEE_RATE = 0.07
 
 @dataclass(frozen=True)
 class BaselineUpStrategyConfig:
+    event_duration_seconds: float = 300.0
+    open_cooldown_seconds: float = 30.0
     entry_edge_threshold: float = 0.03
     entry_confirmation_snapshots: int = 2
     min_entry_seconds_to_end: float = 120.0
     max_entry_seconds_to_end: float = 300.0
     no_new_entry_seconds_to_end: float = 60.0
-    max_holding_seconds: float = 60.0
+    max_holding_seconds: float | None = None
+    forced_exit_seconds_to_end: float | None = None
     max_edge_cap: float = 0.12
     exit_hold_edge_threshold: float = 0.0
+    market_probability_exclusion_low: float | None = 0.40
+    market_probability_exclusion_high: float | None = 0.60
+    confident_exit_fair_probability_threshold: float = 0.86
+    confident_exit_window_seconds: float = 60.0
+    confident_exit_hold_edge_floor: float = -0.02
     timestamp_col: str = "collected_at"
     event_col: str = "event_slug"
     outcome_col: str = "outcome_name"
     fair_price_col: str = "fair_token_price"
+    fair_probability_col: str = "fair_up_probability"
+    market_probability_col: str = "market_implied_up_probability"
     buy_edge_col: str = "buy_edge"
     hold_edge_col: str = "hold_edge"
     bid_price_col: str = "best_bid"
@@ -81,13 +91,19 @@ class BaselineUpSignalEngine:
                 if _is_valid_baseline_entry(
                     current=current,
                     buy_edge_col=self.config.buy_edge_col,
+                    bid_price_col=self.config.bid_price_col,
                     entry_price_col=self.config.entry_price_col,
                     seconds_to_end_col=self.config.seconds_to_end_col,
+                    market_probability_col=self.config.market_probability_col,
+                    event_duration_seconds=self.config.event_duration_seconds,
+                    open_cooldown_seconds=self.config.open_cooldown_seconds,
                     entry_edge_threshold=self.config.entry_edge_threshold,
                     min_entry_seconds_to_end=self.config.min_entry_seconds_to_end,
                     max_entry_seconds_to_end=self.config.max_entry_seconds_to_end,
                     no_new_entry_seconds_to_end=self.config.no_new_entry_seconds_to_end,
                     max_edge_cap=self.config.max_edge_cap,
+                    market_probability_exclusion_low=self.config.market_probability_exclusion_low,
+                    market_probability_exclusion_high=self.config.market_probability_exclusion_high,
                 ):
                     runtime.confirmation_count += 1
                     decision = "confirming"
@@ -104,10 +120,14 @@ class BaselineUpSignalEngine:
                 current=current,
                 hold_edge_col=self.config.hold_edge_col,
                 seconds_to_end_col=self.config.seconds_to_end_col,
+                fair_probability_col=self.config.fair_probability_col,
                 exit_hold_edge_threshold=self.config.exit_hold_edge_threshold,
                 holding_seconds=holding_seconds,
                 max_holding_seconds=self.config.max_holding_seconds,
-                no_new_entry_seconds_to_end=self.config.no_new_entry_seconds_to_end,
+                forced_exit_seconds_to_end=self.config.forced_exit_seconds_to_end,
+                confident_exit_fair_probability_threshold=self.config.confident_exit_fair_probability_threshold,
+                confident_exit_window_seconds=self.config.confident_exit_window_seconds,
+                confident_exit_hold_edge_floor=self.config.confident_exit_hold_edge_floor,
             )
             if exit_reason is not None:
                 decision = "exit"
@@ -188,14 +208,29 @@ class BaselineUpSignalEngine:
     def _validate_config(self) -> None:
         if self.config.entry_confirmation_snapshots <= 0:
             raise ValueError("entry_confirmation_snapshots must be positive")
-        if self.config.max_holding_seconds <= 0:
+        if self.config.event_duration_seconds <= 0:
+            raise ValueError("event_duration_seconds must be positive")
+        if self.config.open_cooldown_seconds < 0:
+            raise ValueError("open_cooldown_seconds must be non-negative")
+        if self.config.open_cooldown_seconds > self.config.event_duration_seconds:
+            raise ValueError("open_cooldown_seconds must not exceed event_duration_seconds")
+        if self.config.max_holding_seconds is not None and self.config.max_holding_seconds <= 0:
             raise ValueError("max_holding_seconds must be positive")
+        if self.config.forced_exit_seconds_to_end is not None and self.config.forced_exit_seconds_to_end < 0:
+            raise ValueError("forced_exit_seconds_to_end must be non-negative")
         if self.config.min_entry_seconds_to_end < self.config.no_new_entry_seconds_to_end:
             raise ValueError("min_entry_seconds_to_end must be >= no_new_entry_seconds_to_end")
         if self.config.max_entry_seconds_to_end < self.config.min_entry_seconds_to_end:
             raise ValueError("max_entry_seconds_to_end must be >= min_entry_seconds_to_end")
         if self.config.max_edge_cap < self.config.entry_edge_threshold:
             raise ValueError("max_edge_cap must be >= entry_edge_threshold")
+        if self.config.market_probability_exclusion_low is not None and self.config.market_probability_exclusion_high is not None:
+            if self.config.market_probability_exclusion_low > self.config.market_probability_exclusion_high:
+                raise ValueError("market_probability_exclusion_low must be <= market_probability_exclusion_high")
+        if self.config.confident_exit_window_seconds <= 0:
+            raise ValueError("confident_exit_window_seconds must be positive")
+        if self.config.confident_exit_hold_edge_floor > self.config.exit_hold_edge_threshold:
+            raise ValueError("confident_exit_hold_edge_floor must be <= exit_hold_edge_threshold")
 
 
 class BaselineUpPaperTradingExecutor:
@@ -306,6 +341,8 @@ def _prepare_baseline_live_row(row: dict[str, Any], config: BaselineUpStrategyCo
     prepared["_timestamp"] = pd.to_datetime(prepared[config.timestamp_col], utc=True)
     for column in [
         config.fair_price_col,
+        config.fair_probability_col,
+        config.market_probability_col,
         config.buy_edge_col,
         config.hold_edge_col,
         config.entry_price_col,
@@ -327,18 +364,28 @@ def _strip_live_payload(event: dict[str, Any]) -> dict[str, Any]:
 
 def replay_baseline_up_strategy(
     rows: pd.DataFrame,
+    event_duration_seconds: float = 300.0,
+    open_cooldown_seconds: float = 30.0,
     entry_edge_threshold: float = 0.03,
     entry_confirmation_snapshots: int = 2,
     min_entry_seconds_to_end: float = 120.0,
     max_entry_seconds_to_end: float = 300.0,
     no_new_entry_seconds_to_end: float = 60.0,
-    max_holding_seconds: float = 60.0,
+    max_holding_seconds: float | None = None,
+    forced_exit_seconds_to_end: float | None = None,
     max_edge_cap: float = 0.12,
     exit_hold_edge_threshold: float = 0.0,
+    market_probability_exclusion_low: float | None = 0.40,
+    market_probability_exclusion_high: float | None = 0.60,
+    confident_exit_fair_probability_threshold: float = 0.86,
+    confident_exit_window_seconds: float = 60.0,
+    confident_exit_hold_edge_floor: float = -0.02,
     timestamp_col: str = "collected_at",
     event_col: str = "event_slug",
     outcome_col: str = "outcome_name",
     fair_price_col: str = "fair_token_price",
+    fair_probability_col: str = "fair_up_probability",
+    market_probability_col: str = "market_implied_up_probability",
     buy_edge_col: str = "buy_edge",
     hold_edge_col: str = "hold_edge",
     bid_price_col: str = "best_bid",
@@ -353,24 +400,48 @@ def replay_baseline_up_strategy(
 
     Baseline rules:
     - trade only the target outcome (default: ``Up``)
+    - skip the market-open cooldown and mid-probability chop zone
     - enter only when ``buy_edge`` exceeds ``entry_edge_threshold``
     - require ``entry_confirmation_snapshots`` consecutive qualifying rows
     - block oversized edges above ``max_edge_cap``
     - buy at current ``best_ask`` and exit at future ``best_bid``
-    - exit when hold edge reverses, max holding time is hit, or time to end is short
+    - exit when hold edge reverses, with optional time-based overrides
     """
     if rows.empty:
         return pd.DataFrame()
-    if entry_confirmation_snapshots <= 0:
-        raise ValueError("entry_confirmation_snapshots must be positive")
-    if max_holding_seconds <= 0:
-        raise ValueError("max_holding_seconds must be positive")
-    if min_entry_seconds_to_end < no_new_entry_seconds_to_end:
-        raise ValueError("min_entry_seconds_to_end must be >= no_new_entry_seconds_to_end")
-    if max_entry_seconds_to_end < min_entry_seconds_to_end:
-        raise ValueError("max_entry_seconds_to_end must be >= min_entry_seconds_to_end")
-    if max_edge_cap < entry_edge_threshold:
-        raise ValueError("max_edge_cap must be >= entry_edge_threshold")
+    BaselineUpStrategyConfig(
+        event_duration_seconds=event_duration_seconds,
+        open_cooldown_seconds=open_cooldown_seconds,
+        entry_edge_threshold=entry_edge_threshold,
+        entry_confirmation_snapshots=entry_confirmation_snapshots,
+        min_entry_seconds_to_end=min_entry_seconds_to_end,
+        max_entry_seconds_to_end=max_entry_seconds_to_end,
+        no_new_entry_seconds_to_end=no_new_entry_seconds_to_end,
+        max_holding_seconds=max_holding_seconds,
+        forced_exit_seconds_to_end=forced_exit_seconds_to_end,
+        max_edge_cap=max_edge_cap,
+        exit_hold_edge_threshold=exit_hold_edge_threshold,
+        market_probability_exclusion_low=market_probability_exclusion_low,
+        market_probability_exclusion_high=market_probability_exclusion_high,
+        confident_exit_fair_probability_threshold=confident_exit_fair_probability_threshold,
+        confident_exit_window_seconds=confident_exit_window_seconds,
+        confident_exit_hold_edge_floor=confident_exit_hold_edge_floor,
+        timestamp_col=timestamp_col,
+        event_col=event_col,
+        outcome_col=outcome_col,
+        fair_price_col=fair_price_col,
+        fair_probability_col=fair_probability_col,
+        market_probability_col=market_probability_col,
+        buy_edge_col=buy_edge_col,
+        hold_edge_col=hold_edge_col,
+        bid_price_col=bid_price_col,
+        ask_price_col=ask_price_col,
+        entry_price_col=entry_price_col,
+        exit_price_col=exit_price_col,
+        seconds_to_end_col=seconds_to_end_col,
+        target_outcome=target_outcome,
+        estimated_fee_rate=estimated_fee_rate,
+    )
 
     prepared = rows.copy()
     required = {
@@ -397,12 +468,16 @@ def replay_baseline_up_strategy(
     prepared["_timestamp"] = pd.to_datetime(prepared[timestamp_col], utc=True)
     for column in [
         fair_price_col,
+        fair_probability_col,
+        market_probability_col,
         buy_edge_col,
         hold_edge_col,
         entry_price_col,
         exit_price_col,
         seconds_to_end_col,
     ]:
+        if column not in prepared.columns:
+            prepared[column] = np.nan
         prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
 
     prepared = prepared.sort_values([event_col, "_timestamp"]).reset_index(drop=True)
@@ -431,13 +506,19 @@ def replay_baseline_up_strategy(
                 if _is_valid_baseline_entry(
                     current=current,
                     buy_edge_col=buy_edge_col,
+                    bid_price_col=bid_price_col,
                     entry_price_col=entry_price_col,
                     seconds_to_end_col=seconds_to_end_col,
+                    market_probability_col=market_probability_col,
+                    event_duration_seconds=event_duration_seconds,
+                    open_cooldown_seconds=open_cooldown_seconds,
                     entry_edge_threshold=entry_edge_threshold,
                     min_entry_seconds_to_end=min_entry_seconds_to_end,
                     max_entry_seconds_to_end=max_entry_seconds_to_end,
                     no_new_entry_seconds_to_end=no_new_entry_seconds_to_end,
                     max_edge_cap=max_edge_cap,
+                    market_probability_exclusion_low=market_probability_exclusion_low,
+                    market_probability_exclusion_high=market_probability_exclusion_high,
                 ):
                     confirmation_count += 1
                 else:
@@ -453,10 +534,14 @@ def replay_baseline_up_strategy(
                 current=current,
                 hold_edge_col=hold_edge_col,
                 seconds_to_end_col=seconds_to_end_col,
+                fair_probability_col=fair_probability_col,
                 exit_hold_edge_threshold=exit_hold_edge_threshold,
                 holding_seconds=holding_seconds,
                 max_holding_seconds=max_holding_seconds,
-                no_new_entry_seconds_to_end=no_new_entry_seconds_to_end,
+                forced_exit_seconds_to_end=forced_exit_seconds_to_end,
+                confident_exit_fair_probability_threshold=confident_exit_fair_probability_threshold,
+                confident_exit_window_seconds=confident_exit_window_seconds,
+                confident_exit_hold_edge_floor=confident_exit_hold_edge_floor,
             )
             if exit_reason is None:
                 continue
@@ -686,20 +771,36 @@ def edge_strategy_summary(episodes: pd.DataFrame) -> dict[str, Any]:
 def _is_valid_baseline_entry(
     current: dict[str, Any],
     buy_edge_col: str,
+    bid_price_col: str,
     entry_price_col: str,
     seconds_to_end_col: str,
+    market_probability_col: str,
+    event_duration_seconds: float,
+    open_cooldown_seconds: float,
     entry_edge_threshold: float,
     min_entry_seconds_to_end: float,
     max_entry_seconds_to_end: float,
     no_new_entry_seconds_to_end: float,
     max_edge_cap: float,
+    market_probability_exclusion_low: float | None,
+    market_probability_exclusion_high: float | None,
 ) -> bool:
     seconds_to_end = _to_float(current.get(seconds_to_end_col), default=np.nan)
     if not np.isfinite(seconds_to_end):
         return False
+    if seconds_to_end > event_duration_seconds - open_cooldown_seconds:
+        return False
     if seconds_to_end < no_new_entry_seconds_to_end:
         return False
     if seconds_to_end < min_entry_seconds_to_end or seconds_to_end > max_entry_seconds_to_end:
+        return False
+    market_probability = _to_float(current.get(market_probability_col), default=np.nan)
+    if (
+        np.isfinite(market_probability)
+        and market_probability_exclusion_low is not None
+        and market_probability_exclusion_high is not None
+        and market_probability_exclusion_low <= market_probability <= market_probability_exclusion_high
+    ):
         return False
 
     buy_edge = _to_float(current.get(buy_edge_col), default=np.nan)
@@ -707,6 +808,7 @@ def _is_valid_baseline_entry(
         np.isfinite(buy_edge)
         and buy_edge >= entry_edge_threshold
         and buy_edge <= max_edge_cap
+        and _finite(current.get(bid_price_col))
         and _finite(current.get(entry_price_col))
     )
 
@@ -715,20 +817,58 @@ def _baseline_exit_reason(
     current: dict[str, Any],
     hold_edge_col: str,
     seconds_to_end_col: str,
+    fair_probability_col: str,
     exit_hold_edge_threshold: float,
     holding_seconds: float,
-    max_holding_seconds: float,
-    no_new_entry_seconds_to_end: float,
+    max_holding_seconds: float | None,
+    forced_exit_seconds_to_end: float | None,
+    confident_exit_fair_probability_threshold: float,
+    confident_exit_window_seconds: float,
+    confident_exit_hold_edge_floor: float,
 ) -> str | None:
     hold_edge = _to_float(current.get(hold_edge_col), default=np.nan)
-    if np.isfinite(hold_edge) and hold_edge < exit_hold_edge_threshold:
+    effective_exit_hold_edge_threshold = _effective_exit_hold_edge_threshold(
+        current=current,
+        fair_probability_col=fair_probability_col,
+        seconds_to_end_col=seconds_to_end_col,
+        exit_hold_edge_threshold=exit_hold_edge_threshold,
+        confident_exit_fair_probability_threshold=confident_exit_fair_probability_threshold,
+        confident_exit_window_seconds=confident_exit_window_seconds,
+        confident_exit_hold_edge_floor=confident_exit_hold_edge_floor,
+    )
+    if np.isfinite(hold_edge) and hold_edge < effective_exit_hold_edge_threshold:
         return "hold_edge_reversal"
-    if holding_seconds >= max_holding_seconds:
+    if max_holding_seconds is not None and holding_seconds >= max_holding_seconds:
         return "max_holding_time"
     seconds_to_end = _to_float(current.get(seconds_to_end_col), default=np.inf)
-    if seconds_to_end < no_new_entry_seconds_to_end:
+    if forced_exit_seconds_to_end is not None and seconds_to_end < forced_exit_seconds_to_end:
         return "time_to_end"
     return None
+
+
+def _effective_exit_hold_edge_threshold(
+    *,
+    current: dict[str, Any],
+    fair_probability_col: str,
+    seconds_to_end_col: str,
+    exit_hold_edge_threshold: float,
+    confident_exit_fair_probability_threshold: float,
+    confident_exit_window_seconds: float,
+    confident_exit_hold_edge_floor: float,
+) -> float:
+    fair_probability = _to_float(current.get(fair_probability_col), default=np.nan)
+    seconds_to_end = _to_float(current.get(seconds_to_end_col), default=np.nan)
+    if (
+        not np.isfinite(fair_probability)
+        or not np.isfinite(seconds_to_end)
+        or fair_probability < confident_exit_fair_probability_threshold
+        or seconds_to_end > confident_exit_window_seconds
+    ):
+        return exit_hold_edge_threshold
+    progress = 1.0 - min(max(seconds_to_end / confident_exit_window_seconds, 0.0), 1.0)
+    return exit_hold_edge_threshold + progress * (
+        confident_exit_hold_edge_floor - exit_hold_edge_threshold
+    )
 
 
 def _baseline_episode_row(

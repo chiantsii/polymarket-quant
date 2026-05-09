@@ -4,6 +4,10 @@ from pathlib import Path
 import pandas as pd
 
 from polymarket_quant.dashboard.data import build_live_dashboard_snapshot
+from polymarket_quant.dashboard.textual_app import (
+    _effective_market_poll_seconds,
+    _effective_ui_refresh_seconds,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -272,3 +276,14 @@ def test_build_live_dashboard_snapshot_builds_asset_snapshots(tmp_path: Path) ->
     assert snapshot["asset_snapshots"]["ETH"]["state_panel"]["event_slug"] == "eth-updown-5m-test"
     assert snapshot["asset_snapshots"]["BTC"]["edge_panel"]["fair_token_price"] == 0.57
     assert snapshot["asset_snapshots"]["ETH"]["edge_panel"]["fair_token_price"] == 0.64
+    assert snapshot["probability_series_by_asset"]["BTC"]["market"] == [0.48]
+    assert snapshot["probability_series_by_asset"]["ETH"]["market"] == [0.61]
+    assert snapshot["probability_series_by_asset"]["BTC"]["fair"] == [0.57]
+    assert snapshot["probability_series_by_asset"]["ETH"]["fair"] == [0.64]
+
+
+def test_textual_dashboard_uses_separate_refresh_and_poll_intervals() -> None:
+    assert _effective_ui_refresh_seconds(0.25) == 0.25
+    assert _effective_ui_refresh_seconds(0.01) == 0.10
+    assert _effective_market_poll_seconds(1.0) == 1.0
+    assert _effective_market_poll_seconds(0.01) == 0.25

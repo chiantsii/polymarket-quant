@@ -41,17 +41,25 @@ def main() -> None:
     parser.add_argument("--paper-signal-path", default=DEFAULT_PAPER_SIGNAL_PATH, help="Latest paper-signal JSONL path")
     parser.add_argument("--paper-order-path", default=DEFAULT_PAPER_ORDER_PATH, help="Latest paper-order JSONL path")
     parser.add_argument("--paper-trade-path", default=DEFAULT_PAPER_TRADE_PATH, help="Latest paper-trade ledger JSONL path")
-    parser.add_argument("--refresh-seconds", type=float, default=2.0, help="Dashboard refresh cadence")
+    parser.add_argument("--refresh-seconds", type=float, default=0.25, help="UI refresh cadence")
+    parser.add_argument("--poll-seconds", type=float, default=1.0, help="Embedded live market poll cadence")
     parser.add_argument("--max-points", type=int, default=80, help="Maximum history points for sparkline panels")
     parser.add_argument("--max-rows", type=int, default=12, help="Maximum rows for stream panels")
     parser.add_argument("--n-samples", type=int, default=1000, help="Pricing simulation paths")
     parser.add_argument("--simulation-dt-seconds", type=float, default=1.0, help="Simulation dt in seconds")
     parser.add_argument("--rollout-horizon-seconds", type=float, default=0.0, help="Optional rollout step override")
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Detector buy-signal threshold")
+    parser.add_argument("--open-cooldown-seconds", type=float, default=30.0, help="Skip new entries during the first N seconds after market open")
     parser.add_argument("--entry-edge-threshold", type=float, default=0.03, help="Baseline strategy entry threshold")
     parser.add_argument("--exit-hold-edge-threshold", type=float, default=0.0, help="Baseline strategy exit hold-edge threshold")
-    parser.add_argument("--max-holding-seconds", type=float, default=60.0, help="Baseline strategy max holding time")
+    parser.add_argument("--max-holding-seconds", type=float, default=None, help="Optional baseline strategy max holding time; disabled by default")
+    parser.add_argument("--forced-exit-seconds-to-end", type=float, default=None, help="Optional forced exit time-to-end threshold; disabled by default")
     parser.add_argument("--max-edge-cap", type=float, default=0.12, help="Ignore oversized entry edges above this cap")
+    parser.add_argument("--market-probability-exclusion-low", type=float, default=0.40, help="Lower bound of market implied probability chop zone exclusion")
+    parser.add_argument("--market-probability-exclusion-high", type=float, default=0.60, help="Upper bound of market implied probability chop zone exclusion")
+    parser.add_argument("--confident-exit-fair-probability-threshold", type=float, default=0.86, help="Relax exit threshold when fair probability is above this level")
+    parser.add_argument("--confident-exit-window-seconds", type=float, default=60.0, help="Apply dynamic confident exit logic inside this time-to-end window")
+    parser.add_argument("--confident-exit-hold-edge-floor", type=float, default=-0.02, help="Most negative hold-edge threshold allowed near settlement for high-confidence states")
     parser.add_argument("--verbose-runtime-logs", action="store_true", help="Show live runtime INFO logs inside the terminal instead of quieting them")
     args = parser.parse_args()
 
@@ -63,6 +71,7 @@ def main() -> None:
             paper_order_path=args.paper_order_path,
             paper_trade_path=args.paper_trade_path,
             refresh_seconds=args.refresh_seconds,
+            poll_seconds=args.poll_seconds,
             max_points=args.max_points,
             max_rows=args.max_rows,
             runtime=(
@@ -87,10 +96,17 @@ def main() -> None:
                     simulation_dt_seconds=args.simulation_dt_seconds,
                     rollout_horizon_seconds=args.rollout_horizon_seconds,
                     edge_threshold=args.edge_threshold,
+                    open_cooldown_seconds=args.open_cooldown_seconds,
                     entry_edge_threshold=args.entry_edge_threshold,
                     exit_hold_edge_threshold=args.exit_hold_edge_threshold,
                     max_holding_seconds=args.max_holding_seconds,
+                    forced_exit_seconds_to_end=args.forced_exit_seconds_to_end,
                     max_edge_cap=args.max_edge_cap,
+                    market_probability_exclusion_low=args.market_probability_exclusion_low,
+                    market_probability_exclusion_high=args.market_probability_exclusion_high,
+                    confident_exit_fair_probability_threshold=args.confident_exit_fair_probability_threshold,
+                    confident_exit_window_seconds=args.confident_exit_window_seconds,
+                    confident_exit_hold_edge_floor=args.confident_exit_hold_edge_floor,
                     quiet_runtime_logs=not args.verbose_runtime_logs,
                 )
                 if args.runtime_mode == "embedded-live"

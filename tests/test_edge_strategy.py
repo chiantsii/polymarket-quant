@@ -155,6 +155,8 @@ def _baseline_row(
     best_bid: float = 0.50,
     best_ask: float = 0.51,
     fair_token_price: float = 0.55,
+    fair_up_probability: float = 0.55,
+    market_implied_up_probability: float = 0.70,
     buy_edge: float = 0.04,
     seconds_to_end: float = 300.0,
     event_slug: str = "btc-updown-5m-test",
@@ -169,6 +171,8 @@ def _baseline_row(
         "best_bid": best_bid,
         "best_ask": best_ask,
         "fair_token_price": fair_token_price,
+        "fair_up_probability": fair_up_probability,
+        "market_implied_up_probability": market_implied_up_probability,
         "buy_edge": buy_edge,
         "hold_edge": fair_token_price - best_bid,
         "sell_edge": best_bid - fair_token_price,
@@ -197,6 +201,34 @@ def test_baseline_up_strategy_requires_two_snapshot_confirmation() -> None:
     assert episodes.loc[0, "entry_execution_delay_seconds"] == pytest.approx(2.0)
 
 
+def test_baseline_up_strategy_skips_market_open_cooldown() -> None:
+    rows = pd.DataFrame(
+        [
+            _baseline_row(0, buy_edge=0.05, seconds_to_end=295, market_implied_up_probability=0.70),
+            _baseline_row(2, buy_edge=0.05, seconds_to_end=293, market_implied_up_probability=0.70),
+            _baseline_row(4, buy_edge=0.05, seconds_to_end=291, market_implied_up_probability=0.70),
+        ]
+    )
+
+    episodes = replay_baseline_up_strategy(rows, open_cooldown_seconds=30.0)
+
+    assert episodes.empty
+
+
+def test_baseline_up_strategy_skips_mid_probability_chop_zone() -> None:
+    rows = pd.DataFrame(
+        [
+            _baseline_row(0, buy_edge=0.05, seconds_to_end=240, market_implied_up_probability=0.50),
+            _baseline_row(2, buy_edge=0.05, seconds_to_end=238, market_implied_up_probability=0.50),
+            _baseline_row(4, buy_edge=0.05, seconds_to_end=236, market_implied_up_probability=0.50),
+        ]
+    )
+
+    episodes = replay_baseline_up_strategy(rows)
+
+    assert episodes.empty
+
+
 def test_baseline_up_strategy_ignores_down_rows_and_oversized_edges() -> None:
     rows = pd.DataFrame(
         [
@@ -208,6 +240,20 @@ def test_baseline_up_strategy_ignores_down_rows_and_oversized_edges() -> None:
     )
 
     episodes = replay_baseline_up_strategy(rows, max_edge_cap=0.15)
+
+    assert episodes.empty
+
+
+def test_baseline_up_strategy_requires_both_bid_and_ask_for_entry() -> None:
+    rows = pd.DataFrame(
+        [
+            _baseline_row(0, buy_edge=0.05, fair_token_price=0.56, best_bid=float("nan"), best_ask=0.50, seconds_to_end=240),
+            _baseline_row(2, buy_edge=0.05, fair_token_price=0.56, best_bid=float("nan"), best_ask=0.50, seconds_to_end=238),
+            _baseline_row(4, buy_edge=0.05, fair_token_price=0.56, best_bid=0.49, best_ask=float("nan"), seconds_to_end=236),
+        ]
+    )
+
+    episodes = replay_baseline_up_strategy(rows)
 
     assert episodes.empty
 
@@ -227,6 +273,40 @@ def test_baseline_up_strategy_exits_on_max_holding_time() -> None:
     assert len(episodes) == 1
     assert episodes.loc[0, "exit_reason"] == "max_holding_time"
     assert episodes.loc[0, "holding_seconds"] == pytest.approx(61.0)
+
+
+def test_baseline_up_strategy_does_not_force_max_holding_time_by_default() -> None:
+    rows = pd.DataFrame(
+        [
+            _baseline_row(0, buy_edge=0.04, fair_token_price=0.56, best_bid=0.49, best_ask=0.50, seconds_to_end=240),
+            _baseline_row(2, buy_edge=0.05, fair_token_price=0.56, best_bid=0.49, best_ask=0.50, seconds_to_end=238),
+            _baseline_row(4, buy_edge=0.02, fair_token_price=0.56, best_bid=0.49, best_ask=0.51, seconds_to_end=236),
+            _baseline_row(65, buy_edge=0.05, fair_token_price=0.60, best_bid=0.55, best_ask=0.56, seconds_to_end=175),
+        ]
+    )
+
+    episodes = replay_baseline_up_strategy(rows)
+
+    assert len(episodes) == 1
+    assert episodes.loc[0, "exit_reason"] == "data_end"
+
+
+def test_baseline_up_strategy_relaxes_exit_near_settlement_for_high_probability() -> None:
+    rows = pd.DataFrame(
+        [
+            _baseline_row(0, buy_edge=0.04, fair_token_price=0.56, best_bid=0.49, best_ask=0.50, seconds_to_end=240, fair_up_probability=0.70),
+            _baseline_row(2, buy_edge=0.05, fair_token_price=0.56, best_bid=0.49, best_ask=0.50, seconds_to_end=238, fair_up_probability=0.72),
+            _baseline_row(4, buy_edge=0.02, fair_token_price=0.56, best_bid=0.49, best_ask=0.51, seconds_to_end=236, fair_up_probability=0.74),
+            _baseline_row(200, buy_edge=0.01, fair_token_price=0.545, best_bid=0.55, best_ask=0.56, seconds_to_end=40, fair_up_probability=0.90),
+            _baseline_row(220, buy_edge=0.01, fair_token_price=0.525, best_bid=0.55, best_ask=0.56, seconds_to_end=20, fair_up_probability=0.92),
+        ]
+    )
+
+    episodes = replay_baseline_up_strategy(rows)
+
+    assert len(episodes) == 1
+    assert episodes.loc[0, "exit_reason"] == "hold_edge_reversal"
+    assert episodes.loc[0, "exit_time"] == rows.loc[4, "collected_at"]
 
 
 def test_baseline_up_strategy_summary_counts_exit_reasons() -> None:
@@ -297,6 +377,20 @@ def test_baseline_up_signal_engine_tracks_confirmation_entry_and_exit() -> None:
     assert decisions[3]["position_state"] == "FLAT"
     assert decisions[3]["exit_reason"] == "hold_edge_reversal"
     assert decisions[3]["closed_episode"]["entry_time"] == rows[2]["collected_at"]
+
+
+def test_baseline_up_signal_engine_reports_confirming_state_without_entry() -> None:
+    rows = [
+        _baseline_row(0, buy_edge=0.031, best_ask=0.50, best_bid=0.49, fair_token_price=0.55, seconds_to_end=240),
+        _baseline_row(2, buy_edge=0.033, best_ask=0.51, best_bid=0.50, fair_token_price=0.55, seconds_to_end=238),
+    ]
+    engine = BaselineUpSignalEngine()
+
+    decisions = [engine.process_row(row) for row in rows]
+
+    assert decisions[0]["decision"] == "confirming"
+    assert decisions[1]["decision"] == "signal_armed"
+    assert decisions[1]["position_state"] == "PENDING_EXECUTION"
 
 
 def test_baseline_up_signal_engine_ignores_non_target_outcomes() -> None:

@@ -92,6 +92,7 @@ def build_live_dashboard_snapshot(
     pnl_panel = _build_pnl_panel(paper_trades)
 
     probability_series = _build_probability_series(signal_rows[-max_points:])
+    probability_series_by_asset = _build_probability_series_by_asset(signal_rows[-max_points:])
     pnl_curve = _build_pnl_curve(paper_trades[-max_points:])
 
     recent_signals = [_compact_signal_row(row) for row in signal_rows[-max_rows:]]
@@ -138,6 +139,7 @@ def build_live_dashboard_snapshot(
         "execution_panel": execution_panel,
         "pnl_panel": pnl_panel,
         "probability_series": probability_series,
+        "probability_series_by_asset": probability_series_by_asset,
         "pnl_curve": pnl_curve,
         "recent_signals": recent_signals,
         "recent_orders": recent_orders,
@@ -215,6 +217,16 @@ def _build_probability_series(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "latent": [_to_float(row.get("latent_up_probability")) for row in rows],
         "fair": [_to_float(row.get("fair_up_probability")) for row in rows],
     }
+
+
+def _build_probability_series_by_asset(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        asset = _row_asset(row)
+        if asset is None:
+            continue
+        grouped.setdefault(asset, []).append(row)
+    return {asset: _build_probability_series(asset_rows) for asset, asset_rows in grouped.items()}
 
 
 def _build_pnl_curve(trades: list[dict[str, Any]]) -> dict[str, Any]:

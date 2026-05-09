@@ -16,6 +16,7 @@ from polymarket_quant.pricing import (
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
     DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
+    DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND,
     DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND,
     MarkovSimulationEngine,
     MarkovSimulationParams,
@@ -46,6 +47,7 @@ class MispricingDetectorConfig:
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
     liquidity_volatility_scale: float = 0.30
     velocity_volatility_scale: float = 0.50
+    min_effective_spot_volatility_per_sqrt_second: float = DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND
     edge_threshold: float = 0.0
     seed: Optional[int] = 42
     transition_bundle: TransitionModelBundle | None = None
@@ -77,6 +79,7 @@ class RealTimeMispricingDetector:
                 liquidity_volatility_scale=self.config.liquidity_volatility_scale,
                 velocity_volatility_scale=self.config.velocity_volatility_scale,
                 rollout_horizon_seconds=self.config.rollout_horizon_seconds,
+                min_effective_spot_volatility_per_sqrt_second=self.config.min_effective_spot_volatility_per_sqrt_second,
             ),
             pricing_model=self.pricing_model,
             transition_bundle=self.config.transition_bundle,
