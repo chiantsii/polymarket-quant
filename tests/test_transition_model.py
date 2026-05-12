@@ -227,7 +227,8 @@ def test_fit_transition_model_artifacts_writes_outputs(tmp_path) -> None:
 
     assert (tmp_path / "artifacts" / "transition_model_latest.joblib").exists()
     assert (tmp_path / "artifacts" / "transition_model_summary_latest.json").exists()
-    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_latest.parquet").exists()
+    assert not (tmp_path / "processed" / "crypto_5m_transition_predictions_latest.parquet").exists()
+    assert result["write_predictions"] is False
     assert result["training_rows"] == len(transition_targets)
 
 
@@ -236,7 +237,33 @@ def test_fit_transition_model_artifacts_writes_split_asset_outputs(tmp_path) -> 
     eth_targets = _synthetic_transition_targets().copy()
     eth_targets["asset"] = "ETH"
     eth_targets["event_slug"] = eth_targets["event_slug"].str.replace("btc-updown", "eth-updown", regex=False)
-    transition_targets = pd.concat([btc_targets, eth_targets], ignore_index=True)
+    btc_dir = tmp_path / "BTC" / "processed" / "transition_targets" / "shards"
+    eth_dir = tmp_path / "ETH" / "processed" / "transition_targets" / "shards"
+    btc_dir.mkdir(parents=True)
+    eth_dir.mkdir(parents=True)
+    btc_targets.to_parquet(btc_dir / "btc-updown-5m-1775578800.parquet", index=False)
+    eth_targets.to_parquet(eth_dir / "eth-updown-5m-1775578800.parquet", index=False)
+
+    result = fit_transition_model_artifacts(
+        transition_target_glob=str(tmp_path / "*" / "processed" / "transition_targets" / "shards" / "*.parquet"),
+        output_dir=str(tmp_path / "artifacts"),
+        prediction_dir=str(tmp_path / "processed"),
+        min_training_rows=32,
+        random_state=11,
+        split_by_asset=True,
+    )
+
+    assert (tmp_path / "artifacts" / "transition_model_btc_latest.joblib").exists()
+    assert (tmp_path / "artifacts" / "transition_model_eth_latest.joblib").exists()
+    assert not (tmp_path / "processed" / "crypto_5m_transition_predictions_btc_latest.parquet").exists()
+    assert not (tmp_path / "processed" / "crypto_5m_transition_predictions_eth_latest.parquet").exists()
+    assert result["split_by_asset"] is True
+    assert result["write_predictions"] is False
+    assert set(result["assets"]) == {"BTC", "ETH"}
+
+
+def test_fit_transition_model_artifacts_can_optionally_write_predictions(tmp_path) -> None:
+    transition_targets = _synthetic_transition_targets()
     input_path = tmp_path / "crypto_5m_transition_targets_latest.parquet"
     transition_targets.to_parquet(input_path, index=False)
 
@@ -247,12 +274,9 @@ def test_fit_transition_model_artifacts_writes_split_asset_outputs(tmp_path) -> 
         include_latest=True,
         min_training_rows=32,
         random_state=11,
-        split_by_asset=True,
+        split_by_asset=False,
+        write_predictions=True,
     )
 
-    assert (tmp_path / "artifacts" / "transition_model_btc_latest.joblib").exists()
-    assert (tmp_path / "artifacts" / "transition_model_eth_latest.joblib").exists()
-    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_btc_latest.parquet").exists()
-    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_eth_latest.parquet").exists()
-    assert result["split_by_asset"] is True
-    assert set(result["assets"]) == {"BTC", "ETH"}
+    assert (tmp_path / "processed" / "crypto_5m_transition_predictions_latest.parquet").exists()
+    assert result["write_predictions"] is True

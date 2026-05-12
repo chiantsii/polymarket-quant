@@ -1,35 +1,36 @@
 import argparse
-from datetime import datetime, timezone
-import joblib
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 
+from polymarket_quant.live.model_loader import (
+    DEFAULT_TRANSITION_MODEL_BTC_PATH,
+    DEFAULT_TRANSITION_MODEL_ETH_PATH,
+)
 from polymarket_quant.pricing import DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND
 from polymarket_quant.pricing import (
-    DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
     DEFAULT_MANUAL_SPOT_JUMP_INTENSITY_PER_SECOND,
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
     DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
     DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
 )
 from polymarket_quant.signals.mispricing import MispricingDetectorConfig, RealTimeMispricingDetector
-from polymarket_quant.state.dataset import load_parquet_glob
+from polymarket_quant.state.dataset import matching_parquet_paths
 from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_EVENT_STATE_GLOB = "data/processed/crypto_5m_event_state_latest.parquet"
-DEFAULT_TRANSITION_MODEL_PATH = "artifacts/transition_model/transition_model_latest.joblib"
+DEFAULT_EVENT_STATE_GLOB = "data/*/processed/event_state/shards/*.parquet"
+DEFAULT_OUTPUT_ROOT = "data"
 
 
 def _validate_transition_bundle(bundle: Any) -> None:
     required_attributes = (
         "spot_mu_model",
         "spot_sigma_model",
-        "spot_jump_model",
     )
     missing = [attribute for attribute in required_attributes if getattr(bundle, attribute, None) is None]
     if missing:
@@ -48,14 +49,12 @@ def _build_detector_config(
     spot_jump_log_return_mean: float,
     spot_jump_log_return_std: float,
     spot_jump_std_multiplier_on_local_sigma: float,
-    force_manual_jump_parameters: bool,
     fallback_spot_volatility_per_sqrt_second: float,
     edge_threshold: float,
     simulation_dt_seconds: float,
     rollout_horizon_seconds: float,
     transition_bundle: Any,
 ) -> MispricingDetectorConfig:
-    """Create the canonical pricing/state assumption bundle for replay."""
     return MispricingDetectorConfig(
         pricing_method=pricing_method,
         n_samples=n_samples,
@@ -64,7 +63,6 @@ def _build_detector_config(
         spot_jump_log_return_mean=spot_jump_log_return_mean,
         spot_jump_log_return_std=spot_jump_log_return_std,
         spot_jump_std_multiplier_on_local_sigma=spot_jump_std_multiplier_on_local_sigma,
-        force_manual_jump_parameters=force_manual_jump_parameters,
         fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
         edge_threshold=edge_threshold,
         simulation_dt_seconds=simulation_dt_seconds,
@@ -75,7 +73,7 @@ def _build_detector_config(
 
 def replay_pricing(
     event_state_glob: str = DEFAULT_EVENT_STATE_GLOB,
-    output_dir: str = "data/processed",
+    output_dir: str = DEFAULT_OUTPUT_ROOT,
     pricing_method: str = "markov_mcmc",
     n_samples: int = 1_000,
     spot_drift_decay_kappa_per_second: float = DEFAULT_SPOT_DRIFT_DECAY_KAPPA_PER_SECOND,
@@ -83,93 +81,177 @@ def replay_pricing(
     spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN,
     spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD,
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA,
-    force_manual_jump_parameters: bool = DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS,
     fallback_spot_volatility_per_sqrt_second: float = 0.0005,
     edge_threshold: float = 0.0,
     simulation_dt_seconds: float = 1.0,
     rollout_horizon_seconds: float = 0.0,
-    transition_model_path: str = DEFAULT_TRANSITION_MODEL_PATH,
+    transition_model_btc_path: str = DEFAULT_TRANSITION_MODEL_BTC_PATH,
+    transition_model_eth_path: str = DEFAULT_TRANSITION_MODEL_ETH_PATH,
+    transition_bundles_by_asset: dict[str, Any] | None = None,
     transition_bundle: Any | None = None,
     max_rows: int | None = None,
     show_progress: bool = False,
     include_latest: bool = False,
-    run_timestamp: str | None = None,
 ) -> dict[str, Any]:
-    """Replay serialized event-state rows through the pricing detector.
+    event_state_paths = matching_parquet_paths(event_state_glob, include_latest=include_latest)
+    if not event_state_paths:
+        raise FileNotFoundError(f"No parquet files matched {event_state_glob}")
 
-    This script is intentionally downstream of state construction:
-    `build_market_state.py` and `build_event_state.py` own state creation,
-    while `replay_pricing.py` only consumes `event_state` rows and prices them.
-    """
-    event_state = load_parquet_glob(event_state_glob, include_latest=include_latest)
-    if transition_bundle is None:
-        bundle_path = Path(transition_model_path)
-        if not bundle_path.exists():
-            raise FileNotFoundError(
-                f"Transition model artifact not found at {transition_model_path}. "
-                "Run scripts/fit_transition_model.py before replay pricing."
-            )
-        transition_bundle = joblib.load(bundle_path)
-    _validate_transition_bundle(transition_bundle)
-
-    detector_config = _build_detector_config(
-        pricing_method=pricing_method,
-        n_samples=n_samples,
-        spot_drift_decay_kappa_per_second=spot_drift_decay_kappa_per_second,
-        spot_jump_intensity_per_second=spot_jump_intensity_per_second,
-        spot_jump_log_return_mean=spot_jump_log_return_mean,
-        spot_jump_log_return_std=spot_jump_log_return_std,
-        spot_jump_std_multiplier_on_local_sigma=spot_jump_std_multiplier_on_local_sigma,
-        force_manual_jump_parameters=force_manual_jump_parameters,
-        fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
-        edge_threshold=edge_threshold,
-        simulation_dt_seconds=simulation_dt_seconds,
-        rollout_horizon_seconds=rollout_horizon_seconds,
+    bundles_by_asset = _resolve_transition_bundles_by_asset(
+        transition_model_btc_path=transition_model_btc_path,
+        transition_model_eth_path=transition_model_eth_path,
+        transition_bundles_by_asset=transition_bundles_by_asset,
         transition_bundle=transition_bundle,
     )
-    if max_rows is not None:
-        event_state = event_state.head(max(int(max_rows), 0)).copy()
+    detectors_by_asset = {
+        asset: RealTimeMispricingDetector(
+            _build_detector_config(
+                pricing_method=pricing_method,
+                n_samples=n_samples,
+                spot_drift_decay_kappa_per_second=spot_drift_decay_kappa_per_second,
+                spot_jump_intensity_per_second=spot_jump_intensity_per_second,
+                spot_jump_log_return_mean=spot_jump_log_return_mean,
+                spot_jump_log_return_std=spot_jump_log_return_std,
+                spot_jump_std_multiplier_on_local_sigma=spot_jump_std_multiplier_on_local_sigma,
+                fallback_spot_volatility_per_sqrt_second=fallback_spot_volatility_per_sqrt_second,
+                edge_threshold=edge_threshold,
+                simulation_dt_seconds=simulation_dt_seconds,
+                rollout_horizon_seconds=rollout_horizon_seconds,
+                transition_bundle=bundle,
+            )
+        )
+        for asset, bundle in bundles_by_asset.items()
+    }
 
-    # Log the implied workload before we start. This is especially useful for
-    # rollout-based pricing, where runtime scales with rows x steps x paths.
-    _log_replay_workload_estimate(
-        event_state=event_state,
-        n_samples=n_samples,
-        pricing_method=pricing_method,
-        rollout_horizon_seconds=rollout_horizon_seconds,
-        simulation_dt_seconds=simulation_dt_seconds,
-    )
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    shard_output_paths: dict[str, str] = {}
+    assets_seen: set[str] = set()
+    remaining_rows = max_rows if max_rows is None else max(int(max_rows), 0)
 
-    detector = RealTimeMispricingDetector(detector_config)
+    for shard_index, event_state_path in enumerate(event_state_paths, start=1):
+        event_state = pd.read_parquet(event_state_path)
+        if event_state.empty:
+            logger.info(
+                "Skipping empty event_state shard %s/%s: %s",
+                shard_index,
+                len(event_state_paths),
+                event_state_path.name,
+            )
+            continue
 
-    replay_rows = detector.detect(
-        state_rows=event_state.to_dict("records"),
-        show_progress=show_progress,
-        progress_description="Pricing replay",
-    )
+        asset, event_slug = _validate_event_state_shard(event_state=event_state, shard_path=event_state_path)
+        detector = detectors_by_asset.get(asset)
+        if detector is None:
+            raise FileNotFoundError(
+                f"No transition model configured for asset {asset}. "
+                f"Expected artifact at {transition_model_btc_path if asset == 'BTC' else transition_model_eth_path}."
+            )
 
-    if not replay_rows:
-        raise ValueError("No replay pricing rows were generated. Check the event-state input rows.")
+        if remaining_rows is not None:
+            if remaining_rows <= 0:
+                break
+            event_state = event_state.head(remaining_rows).copy()
+            if event_state.empty:
+                break
+            remaining_rows -= len(event_state)
 
-    replay = pd.DataFrame(replay_rows)
+        logger.info(
+            "Processing pricing replay shard %s/%s: %s (%s rows)",
+            shard_index,
+            len(event_state_paths),
+            event_state_path.name,
+            len(event_state),
+        )
+        _log_replay_workload_estimate(
+            event_state=event_state,
+            n_samples=n_samples,
+            pricing_method=pricing_method,
+            rollout_horizon_seconds=rollout_horizon_seconds,
+            simulation_dt_seconds=simulation_dt_seconds,
+        )
 
-    # Persist both a timestamped artifact and a *_latest pointer so downstream
-    # inspection scripts can either compare runs or just read the newest output.
-    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    parquet_path = output_path / f"crypto_5m_pricing_replay_{run_timestamp}.parquet"
-    latest_path = output_path / "crypto_5m_pricing_replay_latest.parquet"
-    replay.to_parquet(parquet_path, index=False)
-    replay.to_parquet(latest_path, index=False)
+        replay_rows = detector.detect(
+            state_rows=event_state.to_dict("records"),
+            show_progress=show_progress,
+            progress_description=f"Pricing replay [{asset}:{event_slug}]",
+        )
+        if not replay_rows:
+            raise ValueError(f"No replay pricing rows were generated for event-state shard {event_state_path}")
 
-    logger.info("Saved %s pricing replay rows to %s", len(replay), parquet_path)
+        replay = pd.DataFrame(replay_rows)
+        output_path = _pricing_replay_shard_path(output_root=output_root, asset=asset, event_slug=event_slug)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        replay.to_parquet(output_path, index=False)
+
+        total_rows += len(replay)
+        shard_output_paths[event_slug] = str(output_path)
+        assets_seen.add(asset)
+        logger.info("Saved %s pricing replay rows to %s", len(replay), output_path)
+
+    if not shard_output_paths:
+        raise ValueError("No pricing replay shards were generated.")
 
     return {
-        "rows": len(replay),
-        "output_path": str(parquet_path),
-        "latest_path": str(latest_path),
+        "rows": total_rows,
+        "shard_paths": shard_output_paths,
+        "assets": sorted(assets_seen),
     }
+
+
+def _resolve_transition_bundles_by_asset(
+    *,
+    transition_model_btc_path: str,
+    transition_model_eth_path: str,
+    transition_bundles_by_asset: dict[str, Any] | None,
+    transition_bundle: Any | None,
+) -> dict[str, Any]:
+    if transition_bundles_by_asset:
+        normalized = {str(asset).strip().upper(): bundle for asset, bundle in transition_bundles_by_asset.items()}
+        for bundle in normalized.values():
+            _validate_transition_bundle(bundle)
+        return normalized
+
+    if transition_bundle is not None:
+        _validate_transition_bundle(transition_bundle)
+        return {"BTC": transition_bundle, "ETH": transition_bundle}
+
+    bundle_paths = {
+        "BTC": transition_model_btc_path,
+        "ETH": transition_model_eth_path,
+    }
+    bundles_by_asset: dict[str, Any] = {}
+    for asset, model_path in bundle_paths.items():
+        bundle_path = Path(model_path)
+        if not bundle_path.exists():
+            raise FileNotFoundError(
+                f"Transition model artifact not found for {asset} at {model_path}. "
+                "Run scripts/fit_transition_model.py before replay pricing."
+            )
+        bundle = joblib.load(bundle_path)
+        _validate_transition_bundle(bundle)
+        bundles_by_asset[asset] = bundle
+    return bundles_by_asset
+
+
+def _validate_event_state_shard(*, event_state: pd.DataFrame, shard_path: Path) -> tuple[str, str]:
+    if "asset" not in event_state.columns:
+        raise ValueError(f"Event-state shard is missing asset column: {shard_path}")
+    if "event_slug" not in event_state.columns:
+        raise ValueError(f"Event-state shard is missing event_slug column: {shard_path}")
+
+    assets = sorted(event_state["asset"].dropna().astype(str).str.upper().unique().tolist())
+    event_slugs = sorted(event_state["event_slug"].dropna().astype(str).unique().tolist())
+    if len(assets) != 1:
+        raise ValueError(f"Expected one asset per event_state shard, found {assets} in {shard_path}")
+    if len(event_slugs) != 1:
+        raise ValueError(f"Expected one event_slug per event_state shard, found {event_slugs} in {shard_path}")
+    return assets[0], event_slugs[0]
+
+
+def _pricing_replay_shard_path(*, output_root: Path, asset: str, event_slug: str) -> Path:
+    return output_root / asset / "processed" / "pricing_replay" / "shards" / f"{event_slug}.parquet"
 
 
 def _log_replay_workload_estimate(
@@ -180,7 +262,6 @@ def _log_replay_workload_estimate(
     rollout_horizon_seconds: float,
     simulation_dt_seconds: float,
 ) -> None:
-    """Emit a lightweight runtime estimate before pricing replay starts."""
     if event_state.empty:
         logger.warning("Pricing replay has no event-state rows to process.")
         return
@@ -226,9 +307,9 @@ def _log_replay_workload_estimate(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay serialized event-state rows through pricing models.")
-    parser.add_argument("--event-state-glob", default=DEFAULT_EVENT_STATE_GLOB, help="Event-state parquet glob")
-    parser.add_argument("--output-dir", default="data/processed", help="Output directory for replay parquet")
+    parser = argparse.ArgumentParser(description="Replay serialized event-state shards through pricing models.")
+    parser.add_argument("--event-state-glob", default=DEFAULT_EVENT_STATE_GLOB, help="Event-state shard glob")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_ROOT, help="Output root directory for replay shards")
     parser.add_argument(
         "--pricing-method",
         choices=[
@@ -268,25 +349,19 @@ def main() -> None:
         default=float(DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA),
         help=(
             "Optional manual jump-std multiplier applied to each row's local spot volatility. "
-            "Default is the selected 20x local-sigma jump prior. When positive and manual jump parameters are enabled, replay uses "
+            "Default is the selected 20x local-sigma jump prior. When positive, replay uses "
             "jump_std = multiplier * volatility_per_sqrt_second instead of the fixed jump std."
         ),
     )
     parser.add_argument(
-        "--force-manual-jump-parameters",
-        action="store_true",
-        help="Ignore learned jump kernel outputs and force replay pricing to use the manual jump prior passed on the CLI.",
+        "--transition-model-btc-path",
+        default=DEFAULT_TRANSITION_MODEL_BTC_PATH,
+        help="BTC transition model artifact path",
     )
     parser.add_argument(
-        "--use-learned-jump-parameters",
-        action="store_false",
-        dest="force_manual_jump_parameters",
-        help="Disable the default manual jump prior and fall back to learned jump kernel outputs when available.",
-    )
-    parser.add_argument(
-        "--transition-model-path",
-        default=DEFAULT_TRANSITION_MODEL_PATH,
-        help="Transition model artifact used to learn state-conditioned spot-kernel parameters",
+        "--transition-model-eth-path",
+        default=DEFAULT_TRANSITION_MODEL_ETH_PATH,
+        help="ETH transition model artifact path",
     )
     parser.add_argument("--simulation-dt-seconds", type=float, default=1.0, help="Simulation step size in seconds")
     parser.add_argument(
@@ -299,7 +374,7 @@ def main() -> None:
         "--max-rows",
         type=int,
         default=None,
-        help="Optional cap on the number of event-state rows to replay. Useful for smoke tests and debugging.",
+        help="Optional global cap on the number of event-state rows to replay. Useful for smoke tests and debugging.",
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable progress output during pricing replay")
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Minimum edge required to signal a buy")
@@ -310,7 +385,6 @@ def main() -> None:
         help="Fallback spot volatility used when event_state is missing volatility_per_sqrt_second",
     )
     parser.add_argument("--include-latest", action="store_true", help="Include *_latest.parquet inputs")
-    parser.set_defaults(force_manual_jump_parameters=DEFAULT_FORCE_MANUAL_SPOT_JUMP_PARAMETERS)
     args = parser.parse_args()
 
     result = replay_pricing(
@@ -323,11 +397,11 @@ def main() -> None:
         spot_jump_log_return_mean=args.spot_jump_log_return_mean,
         spot_jump_log_return_std=args.spot_jump_log_return_std,
         spot_jump_std_multiplier_on_local_sigma=args.spot_jump_std_multiplier_on_local_sigma,
-        force_manual_jump_parameters=args.force_manual_jump_parameters,
         edge_threshold=args.edge_threshold,
         simulation_dt_seconds=args.simulation_dt_seconds,
         rollout_horizon_seconds=args.rollout_horizon_seconds,
-        transition_model_path=args.transition_model_path,
+        transition_model_btc_path=args.transition_model_btc_path,
+        transition_model_eth_path=args.transition_model_eth_path,
         max_rows=args.max_rows,
         show_progress=not args.no_progress,
         fallback_spot_volatility_per_sqrt_second=args.fallback_spot_volatility_per_sqrt_second,
