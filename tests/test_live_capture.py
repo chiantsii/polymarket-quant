@@ -276,6 +276,30 @@ class _StubSpotClient:
         }
 
 
+class _SequenceSpotClient:
+    def __init__(self, prices_by_call: list[float]) -> None:
+        self._prices_by_call = prices_by_call
+        self._call_index = 0
+
+    def fetch_spot_ticker(self, asset: str, product_id: str):
+        price = self._prices_by_call[min(self._call_index, len(self._prices_by_call) - 1)]
+        self._call_index += 1
+        ts = datetime.now(timezone.utc)
+        return {
+            "asset": asset,
+            "product_id": product_id,
+            "source": "binance_book_ticker",
+            "collected_at": ts.isoformat(),
+            "exchange_time": ts.isoformat(),
+            "price": price,
+            "bid": price - 0.01,
+            "ask": price + 0.01,
+            "size": 1.0,
+            "volume": None,
+            "trade_id": None,
+        }
+
+
 def test_direct_live_event_state_source_fetches_and_emits_rows(tmp_path: Path, monkeypatch) -> None:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     event_start = now - timedelta(seconds=30)
@@ -323,3 +347,114 @@ def test_direct_live_event_state_source_fetches_and_emits_rows(tmp_path: Path, m
     assert rows[0]["event_slug"] == event_slug
     assert 0.0 <= rows[0]["latent_up_probability"] <= 1.0
     assert (tmp_path / "artifacts" / "live_event_state_latest.parquet").exists()
+    assert source.last_poll_metrics["spot_fetch_ms"] >= 0.0
+    assert source.last_poll_metrics["orderbook_fetch_ms"] >= 0.0
+    assert source.last_poll_metrics["market_state_ms"] >= 0.0
+    assert source.last_poll_metrics["event_state_ms"] >= 0.0
+
+
+def test_direct_live_event_state_source_updates_latest_artifact_from_current_batch_only(tmp_path: Path, monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    event_start = now - timedelta(seconds=30)
+    event_slug = f"btc-updown-5m-{int(event_start.timestamp())}"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "api:",
+                "  gamma_url: https://gamma-api.polymarket.com",
+                "  clob_url: https://clob.polymarket.com",
+                "  binance_url: https://api.binance.com",
+                "data:",
+                f"  raw_dir: {str(tmp_path / 'raw')}",
+                f"  processed_dir: {str(tmp_path / 'processed')}",
+                "spot:",
+                "  products:",
+                "    BTC: BTCUSDT",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _Window:
+        start = event_start
+        end = event_start + timedelta(minutes=5)
+        event_slugs = [event_slug]
+
+    monkeypatch.setattr("polymarket_quant.live.direct.resolve_active_window", lambda **_: _Window())
+
+    source = DirectLiveEventStateSource(
+        DirectLiveSourceConfig(
+            config_path=str(config_path),
+            output_dir=str(tmp_path / "artifacts"),
+            event_slug_prefixes=("btc-updown-5m",),
+            series_slugs=("btc-up-or-down-5m",),
+            spot_tolerance_seconds=10.0,
+        ),
+        polymarket_client=_StubPolymarketClient(event_slug=event_slug, event_start=event_start),
+        spot_client=_StubSpotClient(event_start=event_start),
+    )
+
+    first_rows = source.poll_new_rows()
+    second_rows = source.poll_new_rows()
+
+    assert len(first_rows) == 1
+    assert len(second_rows) == 1
+
+    latest_event_state = pd.read_parquet(tmp_path / "artifacts" / "live_event_state_latest.parquet")
+    assert len(latest_event_state) == 1
+    assert latest_event_state.iloc[0]["event_slug"] == event_slug
+    assert latest_event_state.iloc[0]["collected_at"] == second_rows[0]["collected_at"]
+    assert latest_event_state.iloc[0]["collected_at"] != first_rows[0]["collected_at"]
+
+
+def test_direct_live_event_state_source_preserves_first_observed_reference_price(tmp_path: Path, monkeypatch) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    event_start = now - timedelta(seconds=30)
+    event_slug = f"btc-updown-5m-{int(event_start.timestamp())}"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "api:",
+                "  gamma_url: https://gamma-api.polymarket.com",
+                "  clob_url: https://clob.polymarket.com",
+                "  binance_url: https://api.binance.com",
+                "data:",
+                f"  raw_dir: {str(tmp_path / 'raw')}",
+                f"  processed_dir: {str(tmp_path / 'processed')}",
+                "spot:",
+                "  products:",
+                "    BTC: BTCUSDT",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _Window:
+        start = event_start
+        end = event_start + timedelta(minutes=5)
+        event_slugs = [event_slug]
+
+    monkeypatch.setattr("polymarket_quant.live.direct.resolve_active_window", lambda **_: _Window())
+
+    source = DirectLiveEventStateSource(
+        DirectLiveSourceConfig(
+            config_path=str(config_path),
+            output_dir=str(tmp_path / "artifacts"),
+            event_slug_prefixes=("btc-updown-5m",),
+            series_slugs=("btc-up-or-down-5m",),
+            spot_tolerance_seconds=10.0,
+        ),
+        polymarket_client=_StubPolymarketClient(event_slug=event_slug, event_start=event_start),
+        spot_client=_SequenceSpotClient([101.0, 106.0]),
+    )
+
+    first_rows = source.poll_new_rows()
+    second_rows = source.poll_new_rows()
+
+    assert len(first_rows) == 1
+    assert len(second_rows) == 1
+    assert first_rows[0]["reference_spot_price"] == 101.0
+    assert second_rows[0]["reference_spot_price"] == 101.0
+    assert second_rows[0]["spot_price"] == 106.0

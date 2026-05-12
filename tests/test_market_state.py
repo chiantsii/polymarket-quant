@@ -162,7 +162,9 @@ def test_build_market_state_dataset_adds_latent_and_observation_columns() -> Non
     assert state["latent_market_basis"].notna().all()
     assert state["latent_fundamental_basis"].notna().all()
     assert state["normalized_time_to_end"].between(0.0, 1.0).all()
-    assert "book_velocity" in state.columns
+    assert "book_velocity" not in state.columns
+    assert "mid_price_velocity" not in state.columns
+    assert "micro_price_velocity" not in state.columns
     assert "toxicity_score" not in state.columns
     assert "is_winner" not in state.columns
     assert "outcome_price" not in state.columns
@@ -458,6 +460,8 @@ def test_build_event_state_dataset_collapses_up_and_down_rows() -> None:
     assert event_state["dist_to_boundary"].notna().all()
     assert event_state["book_age_max"].notna().all()
     assert event_state["external_spot_drift"].notna().all()
+    assert "up_book_velocity" not in event_state.columns
+    assert "down_book_velocity" not in event_state.columns
     assert event_state["market_fundamental_basis"].notna().all()
     assert event_state["latent_market_basis"].notna().all()
     assert event_state["latent_fundamental_basis"].notna().all()

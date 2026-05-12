@@ -35,6 +35,7 @@ class IngestionPipeline:
         level_rows = []
         summary_rows = []
         now = datetime.now(timezone.utc)
+        token_rows_by_id: dict[str, Dict[str, Any]] = {}
 
         for series_slug in series_slugs:
             if event_slugs:
@@ -76,35 +77,47 @@ class IngestionPipeline:
                         if not token_id:
                             continue
 
-                        token_row = self._crypto_5m_token_row(
+                        token_rows_by_id[token_id] = self._crypto_5m_token_row(
                             series_slug=series_slug,
                             event=event_detail,
                             market=market,
                             token=token,
                         )
-                        book = self.client.fetch_orderbook(token_id)
-                        if not book:
-                            continue
 
-                        raw_snapshots.append(
-                            {
-                                **token_row,
-                                "collected_at": collected_at,
-                                "orderbook": book,
-                            }
-                        )
-                        summary_rows.append(
-                            self._summarize_orderbook(
-                                {**token_row, "collected_at": collected_at},
-                                book,
-                            )
-                        )
-                        level_rows.extend(
-                            self._orderbook_level_rows(
-                                token_row={**token_row, "collected_at": collected_at},
-                                book=book,
-                            )
-                        )
+        fetch_orderbooks = getattr(self.client, "fetch_orderbooks", None)
+        if callable(fetch_orderbooks):
+            orderbooks_by_token = fetch_orderbooks(list(token_rows_by_id))
+        else:
+            orderbooks_by_token = {
+                token_id: book
+                for token_id in token_rows_by_id
+                for book in [self.client.fetch_orderbook(token_id)]
+                if book
+            }
+        for token_id, token_row in token_rows_by_id.items():
+            book = orderbooks_by_token.get(token_id)
+            if not book:
+                continue
+
+            row_with_timestamp = {**token_row, "collected_at": collected_at}
+            raw_snapshots.append(
+                {
+                    **row_with_timestamp,
+                    "orderbook": book,
+                }
+            )
+            summary_rows.append(
+                self._summarize_orderbook(
+                    row_with_timestamp,
+                    book,
+                )
+            )
+            level_rows.extend(
+                self._orderbook_level_rows(
+                    token_row=row_with_timestamp,
+                    book=book,
+                )
+            )
 
         return raw_snapshots, level_rows, summary_rows
 

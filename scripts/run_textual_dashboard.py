@@ -60,7 +60,11 @@ def main() -> None:
     parser.add_argument("--confident-exit-fair-probability-threshold", type=float, default=0.86, help="Relax exit threshold when fair probability is above this level")
     parser.add_argument("--confident-exit-window-seconds", type=float, default=60.0, help="Apply dynamic confident exit logic inside this time-to-end window")
     parser.add_argument("--confident-exit-hold-edge-floor", type=float, default=-0.02, help="Most negative hold-edge threshold allowed near settlement for high-confidence states")
-    parser.add_argument("--verbose-runtime-logs", action="store_true", help="Show live runtime INFO logs inside the terminal instead of quieting them")
+    parser.add_argument(
+        "--verbose-runtime-logs",
+        action="store_true",
+        help="Print live runtime timing directly to the terminal and run Textual inline so the logs remain in scrollback",
+    )
     args = parser.parse_args()
 
     run_textual_dashboard_app(
@@ -74,6 +78,8 @@ def main() -> None:
             poll_seconds=args.poll_seconds,
             max_points=args.max_points,
             max_rows=args.max_rows,
+            inline_mode=args.verbose_runtime_logs,
+            inline_no_clear=args.verbose_runtime_logs,
             runtime=(
                 EmbeddedLiveRuntimeConfig(
                     runtime_mode=args.runtime_mode,
@@ -108,6 +114,7 @@ def main() -> None:
                     confident_exit_window_seconds=args.confident_exit_window_seconds,
                     confident_exit_hold_edge_floor=args.confident_exit_hold_edge_floor,
                     quiet_runtime_logs=not args.verbose_runtime_logs,
+                    print_timing_to_terminal=args.verbose_runtime_logs,
                 )
                 if args.runtime_mode == "embedded-live"
                 else None

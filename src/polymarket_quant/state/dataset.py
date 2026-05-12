@@ -186,10 +186,14 @@ def build_market_state_rows(
             prepared_orderbooks = prepared_orderbooks.merge(level_features, on=merge_keys, how="left")
     prepared_spot = prepare_spot(spot)
     spot_by_asset = {asset: frame for asset, frame in prepared_spot.groupby("asset", sort=False)}
-    reference_prices = reference_prices_by_event or build_reference_prices(
-        orderbooks=prepared_orderbooks,
-        spot_by_asset=spot_by_asset,
-        event_duration_seconds=event_duration_seconds,
+    reference_prices = (
+        build_reference_prices(
+            orderbooks=prepared_orderbooks,
+            spot_by_asset=spot_by_asset,
+            event_duration_seconds=event_duration_seconds,
+        )
+        if reference_prices_by_event is None
+        else reference_prices_by_event
     )
 
     state_rows = []
@@ -310,9 +314,6 @@ def build_event_state_dataset(market_state: pd.DataFrame) -> pd.DataFrame:
         "ask_tick_density",
         "tick_density",
         "weighted_imbalance",
-        "book_velocity",
-        "mid_price_velocity",
-        "micro_price_velocity",
     ]
     selected_columns = [
         column
@@ -667,34 +668,6 @@ def _add_market_observation_v2_features(
     for column in numeric_cols:
         if column in prepared.columns:
             prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
-
-    sort_cols = [column for column in ("event_slug", "token_id", "collected_at") if column in prepared.columns]
-    prepared = prepared.sort_values(sort_cols).reset_index(drop=True)
-
-    group_cols = [column for column in ("event_slug", "token_id") if column in prepared.columns]
-    if group_cols:
-        prepared["_collected_at_dt"] = _parse_iso8601_utc(prepared["collected_at"])
-        prepared["_dt_seconds"] = (
-            prepared.groupby(group_cols)["_collected_at_dt"].diff().dt.total_seconds().replace(0.0, np.nan)
-        )
-
-        prepared["mid_price_velocity"] = _group_velocity(prepared, group_cols, "mid_price")
-        prepared["micro_price_velocity"] = _group_velocity(prepared, group_cols, "micro_price")
-        normalized_bid_depth_change = _group_relative_change(prepared, group_cols, "bid_depth_top_5")
-        normalized_ask_depth_change = _group_relative_change(prepared, group_cols, "ask_depth_top_5")
-        imbalance_change = _group_abs_change(prepared, group_cols, "weighted_imbalance", fallback="orderbook_imbalance")
-        quote_change = prepared["micro_price_velocity"].abs().where(
-            prepared["micro_price_velocity"].notna(),
-            prepared["mid_price_velocity"].abs(),
-        )
-        depth_change = normalized_bid_depth_change.abs().fillna(0.0) + normalized_ask_depth_change.abs().fillna(0.0)
-        prepared["book_velocity"] = quote_change.fillna(0.0) + imbalance_change.fillna(0.0) + depth_change
-
-        prepared = prepared.drop(columns=["_collected_at_dt", "_dt_seconds"])
-    else:
-        prepared["mid_price_velocity"] = np.nan
-        prepared["micro_price_velocity"] = np.nan
-        prepared["book_velocity"] = np.nan
 
     if fallback_volatility_per_sqrt_second > 0:
         prepared["spot_vol_multiplier"] = (

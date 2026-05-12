@@ -1,13 +1,19 @@
 import json
 from pathlib import Path
 
-from polymarket_quant.dashboard.runtime import EmbeddedLiveRuntime, EmbeddedLiveRuntimeConfig
+from polymarket_quant.dashboard.runtime import EmbeddedLiveRuntime, EmbeddedLiveRuntimeConfig, _format_poll_timing
 
 
 class _StubSource:
     def __init__(self, rows: list[list[dict]]) -> None:
         self.rows = rows
         self.index = 0
+        self.last_poll_metrics = {
+            "spot_fetch_ms": 11.0,
+            "orderbook_fetch_ms": 22.0,
+            "market_state_ms": 33.0,
+            "event_state_ms": 44.0,
+        }
 
     def poll_new_rows(self) -> list[dict]:
         if self.index >= len(self.rows):
@@ -28,9 +34,9 @@ def _event_state_row(collected_at: str, *, buy_edge: float, hold_edge: float, be
         "collected_at": collected_at,
         "outcome_name": "Up",
         "token_id": "tok_up",
-        "market_implied_up_probability": 0.49,
-        "fundamental_up_probability": 0.51,
-        "latent_up_probability": 0.54,
+        "market_implied_up_probability": 0.65,
+        "fundamental_up_probability": 0.66,
+        "latent_up_probability": 0.68,
         "fair_up_probability": 0.58,
         "fair_token_price": 0.58,
         "buy_edge": buy_edge,
@@ -61,7 +67,7 @@ def test_embedded_live_runtime_writes_signal_and_order_artifacts(tmp_path: Path)
         detector=_StubDetector(),
     )
 
-    runtime.poll_once()
+    first_result = runtime.poll_once()
     runtime.poll_once()
     runtime.poll_once()
     runtime.poll_once()
@@ -76,6 +82,38 @@ def test_embedded_live_runtime_writes_signal_and_order_artifacts(tmp_path: Path)
     assert order_rows[1]["side"] == "SELL"
     assert len(trade_rows) == 1
     assert trade_rows[0]["exit_reason"] == "hold_edge_reversal"
+    assert first_result["spot_fetch_ms"] == 11.0
+    assert first_result["orderbook_fetch_ms"] == 22.0
+    assert first_result["market_state_ms"] == 33.0
+    assert first_result["event_state_ms"] == 44.0
+    assert float(first_result["pricing_ms"]) >= 0.0
+    assert float(first_result["executor_ms"]) >= 0.0
+
+
+def test_format_poll_timing_contains_expected_fields() -> None:
+    message = _format_poll_timing(
+        {
+            "spot_fetch_ms": 1.0,
+            "orderbook_fetch_ms": 2.0,
+            "market_state_ms": 3.0,
+            "event_state_ms": 4.0,
+            "pricing_ms": 5.0,
+            "executor_ms": 6.0,
+            "poll_total_ms": 7.0,
+            "new_event_rows": 8,
+            "signal_events": 9,
+            "order_events": 10,
+            "closed_trades": 11,
+        }
+    )
+
+    assert "spot_fetch_ms=1.0" in message
+    assert "orderbook_fetch_ms=2.0" in message
+    assert "market_state_ms=3.0" in message
+    assert "event_state_ms=4.0" in message
+    assert "pricing_ms=5.0" in message
+    assert "executor_ms=6.0" in message
+    assert "poll_total_ms=7.0" in message
 
 
 def _read_jsonl(path: Path) -> list[dict]:

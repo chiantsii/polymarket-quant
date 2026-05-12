@@ -120,6 +120,30 @@ class CountingOpenMarketMockPolymarketClient(OpenMarketMockPolymarketClient):
         return super().fetch_event_by_slug(slug)
 
 
+class BatchOnlyOpenMarketMockPolymarketClient(OpenMarketMockPolymarketClient):
+    def __init__(self):
+        self.fetch_orderbooks_calls = 0
+        self.last_token_ids = []
+
+    def fetch_orderbook(self, token_id):
+        raise AssertionError("Pipeline should use fetch_orderbooks batch path instead of sequential fetch_orderbook")
+
+    def fetch_orderbooks(self, token_ids):
+        self.fetch_orderbooks_calls += 1
+        self.last_token_ids = list(token_ids)
+        return {
+            token_id: {
+                "market": "cond_456",
+                "asset_id": token_id,
+                "timestamp": "1775558597568",
+                "hash": f"book_hash_{token_id}",
+                "bids": [{"price": "0.45", "size": "100.0"}],
+                "asks": [{"price": "0.48", "size": "50.0"}],
+            }
+            for token_id in token_ids
+        }
+
+
 
 def test_live_crypto_5m_orderbook_collection(tmp_path):
     raw_dir = tmp_path / "raw"
@@ -198,3 +222,23 @@ def test_live_collection_reuses_event_detail_cache(tmp_path):
     assert client.series_calls == 0
     assert client.event_calls == 2
     assert set(event_cache) == {"btc-updown-5m-open-event", "eth-updown-5m-open-event"}
+
+
+def test_live_collection_uses_batch_orderbook_fetch(tmp_path):
+    raw_dir = tmp_path / "raw"
+    processed_dir = tmp_path / "processed"
+
+    client = BatchOnlyOpenMarketMockPolymarketClient()
+    pipeline = IngestionPipeline(client, str(raw_dir), str(processed_dir))
+
+    raw_snapshots, level_rows, summary_rows = pipeline.collect_crypto_5m_orderbooks_once(
+        series_slugs=["btc-up-or-down-5m"],
+        event_limit=1,
+        event_slug_prefixes=["btc-updown-5m"],
+    )
+
+    assert client.fetch_orderbooks_calls == 1
+    assert set(client.last_token_ids) == {"tok_up", "tok_down"}
+    assert len(raw_snapshots) == 2
+    assert len(summary_rows) == 2
+    assert len(level_rows) == 4

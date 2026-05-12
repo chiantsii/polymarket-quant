@@ -33,6 +33,8 @@ class TextualDashboardConfig:
     max_points: int = 80
     max_rows: int = 12
     runtime: EmbeddedLiveRuntimeConfig | None = None
+    inline_mode: bool = False
+    inline_no_clear: bool = False
 
 
 def run_textual_dashboard_app(config: TextualDashboardConfig) -> None:
@@ -43,7 +45,10 @@ def run_textual_dashboard_app(config: TextualDashboardConfig) -> None:
             "Textual is not installed. Install it with `pip install textual` or add it to the project environment before running the dashboard."
         ) from exc
 
-    PolymarketDashboardApp(config).run()
+    PolymarketDashboardApp(config).run(
+        inline=config.inline_mode,
+        inline_no_clear=config.inline_no_clear,
+    )
 
 
 class PolymarketDashboardApp(App):  # pragma: no cover - UI runtime

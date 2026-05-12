@@ -53,8 +53,6 @@ DEFAULT_STATE_COLUMNS: tuple[str, ...] = (
     "down_depth_slope",
     "up_tick_density",
     "down_tick_density",
-    "up_book_velocity",
-    "down_book_velocity",
     "cross_book_basis",
     "cross_book_bid_basis",
     "cross_book_ask_basis",

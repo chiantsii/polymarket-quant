@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -67,6 +69,7 @@ class EmbeddedLiveRuntimeConfig:
     confident_exit_window_seconds: float = 60.0
     confident_exit_hold_edge_floor: float = -0.02
     quiet_runtime_logs: bool = True
+    print_timing_to_terminal: bool = False
 
 
 class EmbeddedLiveRuntime:
@@ -111,12 +114,27 @@ class EmbeddedLiveRuntime:
 
         self._prepare_output_files()
 
-    def poll_once(self) -> dict[str, int]:
+    def poll_once(self) -> dict[str, int | float]:
+        poll_started = perf_counter()
         new_event_rows = self.source.poll_new_rows()
+        timing_metrics = _source_timing_metrics(self.source)
         if not new_event_rows:
-            return {"new_event_rows": 0, "signal_events": 0, "order_events": 0, "closed_trades": 0}
+            result = {
+                "new_event_rows": 0,
+                "signal_events": 0,
+                "order_events": 0,
+                "closed_trades": 0,
+                **timing_metrics,
+                "pricing_ms": 0.0,
+                "executor_ms": 0.0,
+                "poll_total_ms": (perf_counter() - poll_started) * 1000.0,
+            }
+            _log_poll_timing(result, print_to_terminal=self.config.print_timing_to_terminal)
+            return result
 
+        pricing_started = perf_counter()
         pricing_rows = self.detector.detect(new_event_rows, show_progress=False)
+        pricing_ms = (perf_counter() - pricing_started) * 1000.0
         pricing_rows = sorted(
             pricing_rows,
             key=lambda row: (
@@ -130,6 +148,7 @@ class EmbeddedLiveRuntime:
         order_events: list[dict[str, Any]] = []
         trade_events: list[dict[str, Any]] = []
 
+        executor_started = perf_counter()
         for row in pricing_rows:
             result = self.executor.process_row(row)
             if result is None:
@@ -143,18 +162,25 @@ class EmbeddedLiveRuntime:
             order_events.extend(result.get("order_events", []))
             if result.get("closed_trade") is not None:
                 trade_events.append(result["closed_trade"])
+        executor_ms = (perf_counter() - executor_started) * 1000.0
 
         self._append_jsonl(self.live_signal_latest_path, signal_events)
         self._append_jsonl(self.paper_signal_latest_path, signal_events)
         self._append_jsonl(self.paper_order_latest_path, order_events)
         self._append_jsonl(self.paper_trade_latest_path, trade_events)
 
-        return {
+        result = {
             "new_event_rows": len(new_event_rows),
             "signal_events": len(signal_events),
             "order_events": len(order_events),
             "closed_trades": len(trade_events),
+            **timing_metrics,
+            "pricing_ms": pricing_ms,
+            "executor_ms": executor_ms,
+            "poll_total_ms": (perf_counter() - poll_started) * 1000.0,
         }
+        _log_poll_timing(result, print_to_terminal=self.config.print_timing_to_terminal)
+        return result
 
     def snapshot_paths(self) -> dict[str, str]:
         return {
@@ -256,6 +282,59 @@ def _json_ready(value: Any) -> Any:
         except Exception:
             return str(value)
     return value
+
+
+def _source_timing_metrics(source: Any) -> dict[str, float]:
+    default = {
+        "spot_fetch_ms": 0.0,
+        "orderbook_fetch_ms": 0.0,
+        "market_state_ms": 0.0,
+        "event_state_ms": 0.0,
+    }
+    metrics = getattr(source, "last_poll_metrics", None)
+    if not isinstance(metrics, dict):
+        return default
+    return {
+        key: float(metrics.get(key, 0.0) or 0.0)
+        for key in default
+    }
+
+
+def _log_poll_timing(metrics: dict[str, int | float], *, print_to_terminal: bool = False) -> None:
+    message = _format_poll_timing(metrics)
+    if print_to_terminal:
+        print(message, file=sys.__stderr__, flush=True)
+        return
+    logger.info(message)
+
+
+def _format_poll_timing(metrics: dict[str, int | float]) -> str:
+    return (
+        "poll timing "
+        "spot_fetch_ms=%.1f "
+        "orderbook_fetch_ms=%.1f "
+        "market_state_ms=%.1f "
+        "event_state_ms=%.1f "
+        "pricing_ms=%.1f "
+        "executor_ms=%.1f "
+        "poll_total_ms=%.1f "
+        "new_event_rows=%s "
+        "signal_events=%s "
+        "order_events=%s "
+        "closed_trades=%s"
+    ) % (
+        float(metrics.get("spot_fetch_ms", 0.0) or 0.0),
+        float(metrics.get("orderbook_fetch_ms", 0.0) or 0.0),
+        float(metrics.get("market_state_ms", 0.0) or 0.0),
+        float(metrics.get("event_state_ms", 0.0) or 0.0),
+        float(metrics.get("pricing_ms", 0.0) or 0.0),
+        float(metrics.get("executor_ms", 0.0) or 0.0),
+        float(metrics.get("poll_total_ms", 0.0) or 0.0),
+        int(metrics.get("new_event_rows", 0) or 0),
+        int(metrics.get("signal_events", 0) or 0),
+        int(metrics.get("order_events", 0) or 0),
+        int(metrics.get("closed_trades", 0) or 0),
+    )
 
 
 def _quiet_textual_runtime_logging() -> None:

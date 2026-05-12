@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -12,7 +13,8 @@ from polymarket_quant.ingestion.client import PolymarketRESTClient
 from polymarket_quant.ingestion.pipeline import IngestionPipeline
 from polymarket_quant.ingestion.spot import BinanceSpotPriceClient, BaseSpotPriceClient, SpotFetchError
 from polymarket_quant.live.capture import DEFAULT_LIVE_STATE_OUTPUT_DIR
-from polymarket_quant.state import build_event_state_dataset, build_market_state_dataset
+from polymarket_quant.state import LatentMarkovStateBuilder, build_event_state_dataset
+from polymarket_quant.state.dataset import build_market_state_rows, finalize_market_state_rows
 from polymarket_quant.utils.logger import get_logger
 
 try:
@@ -70,10 +72,9 @@ class DirectLiveEventStateSource:
         self._current_window_end: datetime | None = None
         self._current_window_slugs: list[str] = []
         self._event_detail_cache: dict[str, dict[str, Any]] = {}
-        self._summary_rows: list[dict[str, Any]] = []
-        self._level_rows: list[dict[str, Any]] = []
-        self._spot_rows: list[dict[str, Any]] = []
         self._seen_keys: set[str] = set()
+        self._state_builder = LatentMarkovStateBuilder()
+        self.last_poll_metrics: dict[str, float] = _empty_poll_metrics()
 
     def poll_new_rows(self) -> list[dict[str, Any]]:
         window = resolve_active_window(
@@ -84,23 +85,46 @@ class DirectLiveEventStateSource:
         if self._current_window_start != window.start:
             self._reset_window(window)
 
+        spot_started = perf_counter()
         batch_spot = self._fetch_spot_batch(window.event_slugs, window.start, window.end)
+        spot_fetch_ms = (perf_counter() - spot_started) * 1000.0
+        orderbook_started = perf_counter()
         batch_summary, batch_levels = self._fetch_orderbook_batch(window.event_slugs)
+        orderbook_fetch_ms = (perf_counter() - orderbook_started) * 1000.0
+        self.last_poll_metrics = {
+            "spot_fetch_ms": spot_fetch_ms,
+            "orderbook_fetch_ms": orderbook_fetch_ms,
+            "market_state_ms": 0.0,
+            "event_state_ms": 0.0,
+        }
         if not batch_summary or not batch_spot:
             return []
 
-        self._summary_rows.extend(batch_summary)
-        self._level_rows.extend(batch_levels)
-        self._spot_rows.extend(batch_spot)
-
-        market_state = build_market_state_dataset(
-            orderbooks=pd.DataFrame(self._summary_rows),
-            spot=pd.DataFrame(self._spot_rows),
-            orderbook_levels=pd.DataFrame(self._level_rows),
+        market_state_started = perf_counter()
+        reference_prices_by_event = self._reference_prices_for_current_window()
+        raw_market_state = build_market_state_rows(
+            orderbooks=pd.DataFrame(batch_summary),
+            spot=pd.DataFrame(batch_spot),
+            orderbook_levels=pd.DataFrame(batch_levels),
+            state_builder=self._state_builder,
             spot_tolerance_seconds=self.config.spot_tolerance_seconds,
             event_duration_seconds=float(self.config.event_duration_seconds),
+            reference_prices_by_event=reference_prices_by_event,
         )
+        market_state = finalize_market_state_rows(
+            raw_market_state,
+            fallback_volatility_per_sqrt_second=self._state_builder.config.fallback_volatility_per_sqrt_second,
+        )
+        market_state_ms = (perf_counter() - market_state_started) * 1000.0
+        event_state_started = perf_counter()
         event_state = build_event_state_dataset(market_state)
+        event_state_ms = (perf_counter() - event_state_started) * 1000.0
+        self.last_poll_metrics = {
+            "spot_fetch_ms": spot_fetch_ms,
+            "orderbook_fetch_ms": orderbook_fetch_ms,
+            "market_state_ms": market_state_ms,
+            "event_state_ms": event_state_ms,
+        }
         self._write_latest_artifacts(market_state, event_state)
 
         if event_state.empty:
@@ -118,9 +142,6 @@ class DirectLiveEventStateSource:
         self._current_window_end = window.end
         self._current_window_slugs = list(window.event_slugs)
         self._event_detail_cache = {}
-        self._summary_rows = []
-        self._level_rows = []
-        self._spot_rows = []
         self._seen_keys = set()
         logger.info(
             "Started new direct-live window %s -> %s for %s",
@@ -160,6 +181,18 @@ class DirectLiveEventStateSource:
         market_state.to_parquet(output_dir / "live_market_state_latest.parquet", index=False)
         event_state.to_parquet(output_dir / "live_event_state_latest.parquet", index=False)
 
+    def _reference_prices_for_current_window(self) -> dict[str, dict[str, Any]]:
+        references: dict[str, dict[str, Any]] = {}
+        for event_slug in self._current_window_slugs:
+            reference_price = self._state_builder.reference_spot_prices.get(event_slug)
+            if reference_price is None:
+                continue
+            references[event_slug] = {
+                "price": reference_price,
+                "source": self._state_builder.reference_sources.get(event_slug, "first_observed"),
+            }
+        return references
+
 
 def _event_slug_by_asset(event_slugs: list[str], spot_products: dict[str, str]) -> dict[str, str]:
     slugs_by_asset: dict[str, str] = {}
@@ -168,3 +201,12 @@ def _event_slug_by_asset(event_slugs: list[str], spot_products: dict[str, str]) 
             if event_slug.startswith(str(asset).lower()):
                 slugs_by_asset[str(asset).upper()] = event_slug
     return slugs_by_asset
+
+
+def _empty_poll_metrics() -> dict[str, float]:
+    return {
+        "spot_fetch_ms": 0.0,
+        "orderbook_fetch_ms": 0.0,
+        "market_state_ms": 0.0,
+        "event_state_ms": 0.0,
+    }
