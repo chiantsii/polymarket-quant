@@ -15,13 +15,11 @@ def _state(
     spot_price: float,
     reference_spot_price: float,
     spot_volatility_per_sqrt_second: float,
-    spot_vol_multiplier: float = 1.0,
 ) -> SimulationMarketState:
     return SimulationMarketState(
         spot_price=spot_price,
         reference_spot_price=reference_spot_price,
         spot_volatility_per_sqrt_second=spot_volatility_per_sqrt_second,
-        spot_vol_multiplier=spot_vol_multiplier,
     )
 
 
@@ -191,10 +189,10 @@ def test_markov_simulation_batch_prices_each_rows_own_threshold() -> None:
             {
                 "spot_price": 101.0,
                 "reference_spot_price": 100.0,
-                    "volatility_per_sqrt_second": 0.0005,
-                    "spot_vol_multiplier": 1.0,
-                    "seconds_to_end": 120.0,
-                },
+                "volatility_per_sqrt_second": 0.0005,
+                "spot_vol_multiplier": 1.0,
+                "seconds_to_end": 120.0,
+            },
             {
                 "spot_price": 99.0,
                 "reference_spot_price": 100.0,
@@ -219,8 +217,6 @@ def test_markov_simulation_prefers_learned_sigma_over_event_state_volatility() -
             spot_jump_log_return_std=0.0,
             n_paths=128,
             simulation_dt_seconds=1.0,
-            liquidity_volatility_scale=10.0,
-            velocity_volatility_scale=10.0,
         )
     )
 
@@ -230,22 +226,12 @@ def test_markov_simulation_prefers_learned_sigma_over_event_state_volatility() -
             spot_price=100.0,
             reference_spot_price=100.0,
             spot_volatility_per_sqrt_second=0.123,
-            liquidity_depth=0.01,
-            book_velocity=99.0,
-            spot_vol_multiplier=50.0,
             learned_spot_volatility_per_sqrt_second=0.456,
         ),
         initial_event_state={
             "spot_price": 100.0,
             "reference_spot_price": 100.0,
             "volatility_per_sqrt_second": 0.0025,
-            "spot_vol_multiplier": 99.0,
-            "up_bid_depth_top_5": 1.0,
-            "up_ask_depth_top_5": 1.0,
-            "down_bid_depth_top_5": 1.0,
-            "down_ask_depth_top_5": 1.0,
-            "up_book_velocity": 999.0,
-            "down_book_velocity": 999.0,
         },
         seed=11,
     )

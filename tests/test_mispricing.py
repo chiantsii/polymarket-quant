@@ -26,7 +26,6 @@ def _state_row(
     weighted_imbalance: float | None = None,
     bid_depth_top_5: float = 100.0,
     ask_depth_top_5: float = 100.0,
-    book_velocity: float = 0.0,
     spot_vol_multiplier: float = 1.0,
     cross_book_basis: float = 0.0,
     dist_to_boundary: float | None = None,
@@ -64,7 +63,6 @@ def _state_row(
         "ask_depth_top_5": ask_depth_top_5,
         "orderbook_imbalance": orderbook_imbalance,
         "weighted_imbalance": weighted_imbalance,
-        "book_velocity": book_velocity,
         "bid_levels": 1,
         "ask_levels": 1,
         "book_hash": "hash",
@@ -250,16 +248,12 @@ def test_simulation_market_state_handles_missing_side_signals_without_warning() 
                 weighted_imbalance=np.nan,
                 bid_depth_top_5=np.nan,
                 ask_depth_top_5=np.nan,
-                book_velocity=np.nan,
                 cross_book_basis=np.nan,
                 dist_to_boundary=np.nan,
             )
         ]
     )
 
-    assert state.liquidity_depth == 0.0
-    assert state.book_velocity == 0.0
-    assert state.spot_vol_multiplier == pytest.approx(1.0)
     assert state.spot_volatility_per_sqrt_second > 0.0
 
 

@@ -30,7 +30,7 @@ from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_EVENT_STATE_PATH = "data/processed/crypto_5m_event_state_latest.parquet"
+DEFAULT_EVENT_STATE_PATH = f"{DEFAULT_LIVE_STATE_OUTPUT_DIR}/live_event_state_latest.parquet"
 DEFAULT_LIVE_SIGNAL_OUTPUT_DIR = "artifacts/live_signal_loop"
 DEFAULT_PAPER_OUTPUT_DIR = "artifacts/paper_trading"
 
@@ -59,7 +59,7 @@ class EmbeddedLiveRuntimeConfig:
     edge_threshold: float = 0.0
     open_cooldown_seconds: float = 30.0
     entry_edge_threshold: float = 0.03
-    exit_hold_edge_threshold: float = 0.0
+    exit_hold_edge_threshold: float = -0.02
     max_holding_seconds: float | None = None
     forced_exit_seconds_to_end: float | None = None
     max_edge_cap: float = 0.12

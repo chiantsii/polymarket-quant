@@ -1,7 +1,6 @@
 import argparse
 import json
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +26,7 @@ from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_EVENT_STATE_PATH = "data/processed/crypto_5m_event_state_latest.parquet"
+DEFAULT_EVENT_STATE_PATH = f"{DEFAULT_LIVE_STATE_OUTPUT_DIR}/live_event_state_latest.parquet"
 def run_paper_trading_executor(
     *,
     source_mode: str = "direct-live",
@@ -52,7 +51,7 @@ def run_paper_trading_executor(
     edge_threshold: float = 0.0,
     open_cooldown_seconds: float = 30.0,
     entry_edge_threshold: float = 0.03,
-    exit_hold_edge_threshold: float = 0.0,
+    exit_hold_edge_threshold: float = -0.02,
     max_holding_seconds: float | None = None,
     forced_exit_seconds_to_end: float | None = None,
     max_edge_cap: float = 0.12,
@@ -88,15 +87,14 @@ def run_paper_trading_executor(
         )
     )
 
-    run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    signal_path = out_dir / f"paper_signal_events_{run_timestamp}.jsonl"
-    order_path = out_dir / f"paper_order_events_{run_timestamp}.jsonl"
-    trade_path = out_dir / f"paper_trade_ledger_{run_timestamp}.jsonl"
-    latest_signal_path = out_dir / "paper_signal_events_latest.jsonl"
-    latest_order_path = out_dir / "paper_order_events_latest.jsonl"
-    latest_trade_path = out_dir / "paper_trade_ledger_latest.jsonl"
+    signal_path = out_dir / "paper_signal_events_latest.jsonl"
+    order_path = out_dir / "paper_order_events_latest.jsonl"
+    trade_path = out_dir / "paper_trade_ledger_latest.jsonl"
+    signal_path.write_text("", encoding="utf-8")
+    order_path.write_text("", encoding="utf-8")
+    trade_path.write_text("", encoding="utf-8")
 
     seen_keys: set[str] = set()
     if source_mode == "direct-live":
@@ -175,9 +173,6 @@ def run_paper_trading_executor(
                     )
                 processed_event_rows += len(new_event_rows)
 
-            latest_signal_path.write_text(signal_path.read_text(encoding="utf-8"), encoding="utf-8")
-            latest_order_path.write_text(order_path.read_text(encoding="utf-8"), encoding="utf-8")
-            latest_trade_path.write_text(trade_path.read_text(encoding="utf-8"), encoding="utf-8")
             if max_polls > 0 and poll_count >= max_polls:
                 break
             time.sleep(max(poll_interval_seconds, 0.0))
@@ -187,9 +182,9 @@ def run_paper_trading_executor(
         "signal_path": str(signal_path),
         "order_path": str(order_path),
         "trade_path": str(trade_path),
-        "latest_signal_path": str(latest_signal_path),
-        "latest_order_path": str(latest_order_path),
-        "latest_trade_path": str(latest_trade_path),
+        "latest_signal_path": str(signal_path),
+        "latest_order_path": str(order_path),
+        "latest_trade_path": str(trade_path),
         "live_event_state_path": str(Path(live_state_output_dir) / "live_event_state_latest.parquet"),
         "processed_event_rows": processed_event_rows,
         "processed_orders": processed_orders,
@@ -279,7 +274,7 @@ def main() -> None:
     parser.add_argument("--edge-threshold", type=float, default=0.0, help="Detector buy-signal threshold")
     parser.add_argument("--open-cooldown-seconds", type=float, default=30.0, help="Skip new entries during the first N seconds after market open")
     parser.add_argument("--entry-edge-threshold", type=float, default=0.03, help="Baseline strategy entry threshold")
-    parser.add_argument("--exit-hold-edge-threshold", type=float, default=0.0, help="Baseline strategy exit hold-edge threshold")
+    parser.add_argument("--exit-hold-edge-threshold", type=float, default=-0.02, help="Baseline strategy forced-reassessment hold-edge threshold")
     parser.add_argument("--max-holding-seconds", type=float, default=None, help="Optional baseline strategy max holding time; disabled by default")
     parser.add_argument("--forced-exit-seconds-to-end", type=float, default=None, help="Optional forced exit time-to-end threshold; disabled by default")
     parser.add_argument("--max-edge-cap", type=float, default=0.12, help="Ignore oversized entry edges above this cap")

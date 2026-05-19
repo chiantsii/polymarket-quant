@@ -45,8 +45,6 @@ class MispricingDetectorConfig:
     spot_jump_log_return_mean: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_MEAN
     spot_jump_log_return_std: float = DEFAULT_MANUAL_SPOT_JUMP_LOG_RETURN_STD
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
-    liquidity_volatility_scale: float = 0.30
-    velocity_volatility_scale: float = 0.50
     min_effective_spot_volatility_per_sqrt_second: float = DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND
     edge_threshold: float = 0.0
     seed: Optional[int] = 42
@@ -76,8 +74,6 @@ class RealTimeMispricingDetector:
                 spot_jump_std_multiplier_on_local_sigma=self.config.spot_jump_std_multiplier_on_local_sigma,
                 simulation_dt_seconds=self.config.simulation_dt_seconds,
                 n_paths=self.config.n_samples,
-                liquidity_volatility_scale=self.config.liquidity_volatility_scale,
-                velocity_volatility_scale=self.config.velocity_volatility_scale,
                 rollout_horizon_seconds=self.config.rollout_horizon_seconds,
                 min_effective_spot_volatility_per_sqrt_second=self.config.min_effective_spot_volatility_per_sqrt_second,
             ),
@@ -310,72 +306,24 @@ class RealTimeMispricingDetector:
                 "ask_depth_top_5": event_state_row.get(f"{side}_ask_depth_top_5"),
                 "orderbook_imbalance": event_state_row.get(f"{side}_orderbook_imbalance"),
                 "weighted_imbalance": event_state_row.get(f"{side}_weighted_imbalance"),
-                "book_velocity": event_state_row.get(f"{side}_book_velocity"),
             }
             rows.append(self._valuation_row(row=row, pricing=pricing))
         return rows
 
     def _simulation_market_state(self, event_rows: List[Dict[str, Any]]) -> SimulationMarketState:
-        up_row = next((row for row in event_rows if str(row.get("outcome_name", "")).lower() == "up"), None)
-        down_row = next((row for row in event_rows if str(row.get("outcome_name", "")).lower() == "down"), None)
-
-        liquidity_depth = self._nanmin_or_default(
-            [
-                self._nan_if_none(self._row_market_signal(up_row, "bid_depth_top_5")),
-                self._nan_if_none(self._row_market_signal(up_row, "ask_depth_top_5")),
-                self._nan_if_none(self._row_market_signal(down_row, "bid_depth_top_5")),
-                self._nan_if_none(self._row_market_signal(down_row, "ask_depth_top_5")),
-            ],
-            default=0.0,
-        )
-
-        book_velocity = self._nanmean_or_default(
-            [
-                abs(self._nan_if_none(self._row_market_signal(up_row, "book_velocity"))),
-                abs(self._nan_if_none(self._row_market_signal(down_row, "book_velocity"))),
-            ],
-            default=0.0,
-        )
-
-        spot_vol_multiplier = self._to_float(event_rows[0].get("spot_vol_multiplier")) or 1.0
-
         return SimulationMarketState(
             spot_price=self._to_float(event_rows[0].get("spot_price")),
             reference_spot_price=self._to_float(event_rows[0].get("reference_spot_price")),
             spot_volatility_per_sqrt_second=self._to_float(event_rows[0].get("volatility_per_sqrt_second"))
             or self.config.fallback_spot_volatility_per_sqrt_second,
-            liquidity_depth=liquidity_depth,
-            book_velocity=book_velocity,
-            spot_vol_multiplier=spot_vol_multiplier,
         )
 
     def _simulation_market_state_from_event_state(self, event_state_row: Dict[str, Any]) -> SimulationMarketState:
-        liquidity_depth = self._nanmin_or_default(
-            [
-                self._nan_if_none(self._to_float(event_state_row.get("up_bid_depth_top_5"))),
-                self._nan_if_none(self._to_float(event_state_row.get("up_ask_depth_top_5"))),
-                self._nan_if_none(self._to_float(event_state_row.get("down_bid_depth_top_5"))),
-                self._nan_if_none(self._to_float(event_state_row.get("down_ask_depth_top_5"))),
-            ],
-            default=0.0,
-        )
-        book_velocity = self._nanmean_or_default(
-            [
-                abs(self._nan_if_none(self._to_float(event_state_row.get("up_book_velocity")))),
-                abs(self._nan_if_none(self._to_float(event_state_row.get("down_book_velocity")))),
-            ],
-            default=0.0,
-        )
-        spot_vol_multiplier = self._to_float(event_state_row.get("spot_vol_multiplier")) or 1.0
-
         return SimulationMarketState(
             spot_price=self._to_float(event_state_row.get("spot_price")),
             reference_spot_price=self._to_float(event_state_row.get("reference_spot_price")),
             spot_volatility_per_sqrt_second=self._to_float(event_state_row.get("volatility_per_sqrt_second"))
             or self.config.fallback_spot_volatility_per_sqrt_second,
-            liquidity_depth=liquidity_depth,
-            book_velocity=book_velocity,
-            spot_vol_multiplier=spot_vol_multiplier,
         )
 
     def _has_pricing_inputs(self, row: Dict[str, Any]) -> bool:
@@ -393,41 +341,6 @@ class RealTimeMispricingDetector:
             and np.isfinite(reference_spot_price)
             and reference_spot_price > 0
         )
-
-    def _row_market_signal(self, row: Optional[Dict[str, Any]], *columns: str) -> Optional[float]:
-        if row is None:
-            return None
-        for column in columns:
-            value = self._to_float(row.get(column))
-            if value is not None:
-                return value
-        return None
-
-    @staticmethod
-    def _nan_if_none(value: Optional[float]) -> float:
-        if value is None:
-            return np.nan
-        try:
-            value_float = float(value)
-        except (TypeError, ValueError):
-            return np.nan
-        return value_float if np.isfinite(value_float) else np.nan
-
-    @staticmethod
-    def _nanmean_or_default(values: Iterable[float], default: float = 0.0) -> float:
-        array = np.asarray(list(values), dtype=float)
-        finite = array[np.isfinite(array)]
-        if finite.size == 0:
-            return float(default)
-        return float(np.mean(finite))
-
-    @staticmethod
-    def _nanmin_or_default(values: Iterable[float], default: float = 0.0) -> float:
-        array = np.asarray(list(values), dtype=float)
-        finite = array[np.isfinite(array)]
-        if finite.size == 0:
-            return float(default)
-        return float(np.min(finite))
 
     def _to_float(self, value: Any) -> Optional[float]:
         if value is None:

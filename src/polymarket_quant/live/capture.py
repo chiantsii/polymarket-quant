@@ -12,9 +12,9 @@ from polymarket_quant.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_LIVE_ORDERBOOK_SUMMARY_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_summary_latest.parquet"
-DEFAULT_LIVE_ORDERBOOK_LEVELS_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_levels_latest.parquet"
-DEFAULT_LIVE_SPOT_GLOB = "data/*/processed/spot/binance_spot_ticks_latest.parquet"
+DEFAULT_LIVE_ORDERBOOK_SUMMARY_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_summary_*.parquet"
+DEFAULT_LIVE_ORDERBOOK_LEVELS_GLOB = "data/*/processed/polymarket/crypto_5m_orderbook_levels_*.parquet"
+DEFAULT_LIVE_SPOT_GLOB = "data/*/processed/spot/binance_spot_ticks_*.parquet"
 DEFAULT_LIVE_STATE_OUTPUT_DIR = "artifacts/live_state"
 
 
@@ -38,7 +38,7 @@ class LiveCaptureStateSnapshot:
 
 
 class LiveCaptureEventStateSource:
-    """Build incremental event-state rows from live-capture latest parquet files."""
+    """Build incremental event-state rows from the latest timestamped capture batches."""
 
     def __init__(self, config: LiveCaptureSourceConfig | None = None) -> None:
         self.config = config or LiveCaptureSourceConfig()
@@ -85,9 +85,9 @@ def load_live_capture_state_snapshot(
 ) -> LiveCaptureStateSnapshot:
     config = config or LiveCaptureSourceConfig()
 
-    summary_paths = _matching_paths(config.orderbook_summary_glob)
-    spot_paths = _matching_paths(config.spot_glob)
-    level_paths = _matching_paths(config.orderbook_levels_glob)
+    summary_paths = _latest_timestamped_paths_by_asset(config.orderbook_summary_glob)
+    spot_paths = _latest_timestamped_paths_by_asset(config.spot_glob)
+    level_paths = _latest_timestamped_paths_by_asset(config.orderbook_levels_glob)
 
     if not summary_paths:
         logger.warning("No live orderbook summary parquet files matched %s", config.orderbook_summary_glob)
@@ -138,8 +138,21 @@ def load_live_capture_state_snapshot(
     )
 
 
-def _matching_paths(pattern: str) -> list[Path]:
-    return [Path(path) for path in sorted(glob.glob(pattern))]
+def _latest_timestamped_paths_by_asset(pattern: str) -> list[Path]:
+    matched_paths = [Path(path) for path in sorted(glob.glob(pattern))]
+    timestamped_paths = [path for path in matched_paths if not path.name.endswith("_latest.parquet")]
+    if matched_paths and not timestamped_paths:
+        logger.warning(
+            "Ignoring aggregate *_latest.parquet capture inputs for %s; expected timestamped batch parquet files.",
+            pattern,
+        )
+    latest_by_asset: dict[str, Path] = {}
+    for path in timestamped_paths:
+        asset = path.parents[2].name
+        current = latest_by_asset.get(asset)
+        if current is None or path.name > current.name:
+            latest_by_asset[asset] = path
+    return [latest_by_asset[asset] for asset in sorted(latest_by_asset)]
 
 
 def _read_parquet_paths(paths: list[Path]) -> pd.DataFrame:

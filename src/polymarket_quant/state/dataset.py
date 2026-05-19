@@ -771,16 +771,7 @@ def _add_regime_posterior_features(rows: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1, skipna=True).fillna(0.0)
 
-    mean_book_velocity = pd.concat(
-        [
-            _numeric_series(prepared, "up_book_velocity").abs(),
-            _numeric_series(prepared, "down_book_velocity").abs(),
-        ],
-        axis=1,
-    ).mean(axis=1, skipna=True).fillna(0.0)
-
     vol_pressure = (_numeric_series(prepared, "spot_vol_multiplier") - 1.0).clip(lower=0.0).fillna(0.0)
-    velocity_pressure = (mean_book_velocity / 0.05).clip(lower=0.0)
     time_pressure = (1.0 - _numeric_series(prepared, "normalized_time_to_end")).clip(lower=0.0, upper=1.0).fillna(0.0)
     boundary_proximity = (1.0 - 2.0 * _numeric_series(prepared, "dist_to_boundary")).clip(lower=0.0, upper=1.0).fillna(0.0)
     cross_alignment = (
@@ -788,7 +779,7 @@ def _add_regime_posterior_features(rows: pd.DataFrame) -> pd.DataFrame:
     ).fillna(0.0)
 
     normal_score = 1.0 - 0.5 * basis_pressure - 0.5 * vol_pressure - 0.35 * time_pressure
-    shock_score = 1.5 * basis_pressure + 1.0 * vol_pressure + 0.75 * velocity_pressure
+    shock_score = 1.5 * basis_pressure + 1.0 * vol_pressure
     convergence_score = 1.75 * time_pressure + 1.0 * boundary_proximity + 0.75 * cross_alignment - 0.25 * vol_pressure
 
     logits = np.column_stack(

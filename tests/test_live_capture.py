@@ -98,16 +98,16 @@ def _spot_row_for_event(timestamp, event_slug: str, price: float):
     }
 
 
-def _write_live_latest_files(
+def _write_live_batch_files(
     root: Path,
     *,
     orderbook_rows: list[dict],
     level_rows: list[dict],
     spot_rows: list[dict],
 ) -> tuple[Path, Path, Path]:
-    summary_path = root / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_summary_latest.parquet"
-    levels_path = root / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_levels_latest.parquet"
-    spot_path = root / "BTC" / "processed" / "spot" / "binance_spot_ticks_latest.parquet"
+    summary_path = root / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_summary_20260519_100000.parquet"
+    levels_path = root / "BTC" / "processed" / "polymarket" / "crypto_5m_orderbook_levels_20260519_100000.parquet"
+    spot_path = root / "BTC" / "processed" / "spot" / "binance_spot_ticks_20260519_100000.parquet"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     levels_path.parent.mkdir(parents=True, exist_ok=True)
     spot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,7 +122,7 @@ def test_load_live_capture_state_snapshot_builds_event_state_from_latest_files(t
     start = datetime.fromtimestamp(1775578800, tz=timezone.utc)
     ts_1 = start + timedelta(seconds=1)
 
-    summary_path, levels_path, spot_path = _write_live_latest_files(
+    summary_path, levels_path, spot_path = _write_live_batch_files(
         tmp_path,
         orderbook_rows=[
             _orderbook_row(ts_1, event_slug, "Up", "tok_up", 0.50, 0.51),
@@ -157,7 +157,7 @@ def test_live_capture_event_state_source_only_emits_unseen_rows(tmp_path: Path) 
     ts_1 = start + timedelta(seconds=1)
     ts_2 = start + timedelta(seconds=2)
 
-    summary_path, levels_path, spot_path = _write_live_latest_files(
+    summary_path, levels_path, spot_path = _write_live_batch_files(
         tmp_path,
         orderbook_rows=[
             _orderbook_row(ts_1, event_slug, "Up", "tok_up", 0.50, 0.51),
@@ -187,7 +187,7 @@ def test_live_capture_event_state_source_only_emits_unseen_rows(tmp_path: Path) 
     second_rows = source.poll_new_rows()
     assert second_rows == []
 
-    _write_live_latest_files(
+    _write_live_batch_files(
         tmp_path,
         orderbook_rows=[
             _orderbook_row(ts_1, event_slug, "Up", "tok_up", 0.50, 0.51),

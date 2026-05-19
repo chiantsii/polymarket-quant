@@ -98,10 +98,9 @@ class LatentMarkovStateBuilder:
                 spot_price=spot_price,
                 reference_payload=reference_prices_by_event.get(event_slug),
             )
-            # The latent update combines three ingredients:
+            # The current latent update is a present-time fusion of:
             # 1. a spot/reference-based fundamental anchor
             # 2. a market-implied observation from the orderbook
-            # 3. the previous latent state propagated forward in time
             volatility = self._realized_volatility_per_sqrt_second(asset, timestamp)
             observation_summary = self._event_observation_summary(event_rows, timestamp)
             estimate = self._estimate_latent_state(
@@ -169,7 +168,7 @@ class LatentMarkovStateBuilder:
             resolved_observation_variance = (
                 observation_variance if observation_variance is not None else self.config.observation_std**2
             )
-            anchor_variance = self._anchor_variance(resolved_observation_variance)
+            anchor_variance = self._anchor_variance()
             # Current latent state is a present-time fusion of the fundamental
             # anchor and the current market observation. Transition dynamics are
             # learned later in the transition kernel, not hard-coded here.
@@ -221,9 +220,10 @@ class LatentMarkovStateBuilder:
             / (prior_precision + observation_precision)
         )
 
-    def _anchor_variance(self, observation_variance: float) -> float:
+    def _anchor_variance(self) -> float:
         anchor_weight = float(np.clip(self.config.anchor_weight, 1e-3, 1.0 - 1e-3))
-        return float(max(observation_variance * (1.0 - anchor_weight) / anchor_weight, 1e-6))
+        base_observation_variance = max(self.config.observation_std**2, 1e-6)
+        return float(max(base_observation_variance * (1.0 - anchor_weight) / anchor_weight, 1e-6))
 
     def _observation_variance(self, event_rows: List[Dict[str, Any]], timestamp: datetime) -> float:
         return self._event_observation_summary(event_rows, timestamp).observation_variance or max(

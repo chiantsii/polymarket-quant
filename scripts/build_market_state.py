@@ -1,5 +1,4 @@
 import argparse
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -144,13 +143,11 @@ def build_market_state(
     result: dict[str, object] = {
         "rows": row_count,
         "output_paths": {asset: payload["output_path"] for asset, payload in asset_outputs.items()},
-        "latest_paths": {asset: payload["latest_path"] for asset, payload in asset_outputs.items()},
         "shard_dirs": {asset: payload["shard_dir"] for asset, payload in asset_outputs.items()},
     }
     if len(asset_outputs) == 1:
         asset_payload = next(iter(asset_outputs.values()))
         result["output_path"] = asset_payload["output_path"]
-        result["latest_path"] = asset_payload["latest_path"]
         result["shard_dir"] = asset_payload["shard_dir"]
     return result
 
@@ -360,11 +357,8 @@ def _finalize_market_state_batch_parquets(
                     writer = writers_by_asset.get(asset_name)
                     if writer is None:
                         parquet_path = Path(payload["output_path"])
-                        latest_path = Path(payload["latest_path"])
                         if parquet_path.exists():
                             parquet_path.unlink()
-                        if latest_path.exists():
-                            latest_path.unlink()
                         first_table = pa.Table.from_pandas(asset_batch, preserve_index=False)
                         writer = pq.ParquetWriter(parquet_path, first_table.schema)
                         writers_by_asset[asset_name] = writer
@@ -404,9 +398,6 @@ def _finalize_market_state_batch_parquets(
 
     if total_rows == 0:
         raise ValueError("No finalized market-state rows were produced from raw batches.")
-    for asset, payload in asset_outputs.items():
-        shutil.copyfile(payload["output_path"], payload["latest_path"])
-        logger.info("Copied latest market-state parquet for %s to %s", asset, payload["latest_path"])
     return total_rows, asset_outputs
 
 
@@ -424,7 +415,6 @@ def _prepare_asset_dataset_paths(
     shards_dir.mkdir(parents=True, exist_ok=True)
     return {
         "output_path": str(dataset_dir / f"{dataset_prefix}_{run_timestamp}.parquet"),
-        "latest_path": str(dataset_dir / f"{dataset_prefix}_latest.parquet"),
         "shard_dir": str(shards_dir),
     }
 
@@ -460,7 +450,6 @@ def _write_asset_dataset_outputs(
             .reset_index(drop=True)
         )
         asset_frame.to_parquet(payload["output_path"], index=False)
-        shutil.copyfile(payload["output_path"], payload["latest_path"])
         shard_updates = _upsert_event_shards(
             rows=asset_frame,
             shards_dir=Path(payload["shard_dir"]),

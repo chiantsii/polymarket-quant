@@ -37,9 +37,6 @@ class SimulationMarketState:
     spot_price: float | None = None
     reference_spot_price: float | None = None
     spot_volatility_per_sqrt_second: float = 0.0005
-    liquidity_depth: float = 0.0
-    book_velocity: float = 0.0
-    spot_vol_multiplier: float = 1.0
     learned_spot_log_drift_per_second: float | None = None
     learned_spot_volatility_per_sqrt_second: float | None = None
 
@@ -57,8 +54,6 @@ class MarkovSimulationParams:
     spot_jump_std_multiplier_on_local_sigma: float = DEFAULT_MANUAL_SPOT_JUMP_STD_MULTIPLIER_ON_LOCAL_SIGMA
     simulation_dt_seconds: float = 1.0
     n_paths: int = 1_000
-    liquidity_volatility_scale: float = 0.30
-    velocity_volatility_scale: float = 0.50
     rollout_horizon_seconds: float = 0.0
     min_effective_spot_volatility_per_sqrt_second: float = DEFAULT_MIN_EFFECTIVE_SPOT_VOLATILITY_PER_SQRT_SECOND
 
@@ -343,23 +338,6 @@ class MarkovSimulationEngine:
                 default=max(self.params.base_spot_volatility_per_sqrt_second, 0.0),
             )
             or max(self.params.base_spot_volatility_per_sqrt_second, 0.0),
-            liquidity_depth=_nanmin(
-                [
-                    _coerce_float(event_state_row.get("up_bid_depth_top_5")),
-                    _coerce_float(event_state_row.get("up_ask_depth_top_5")),
-                    _coerce_float(event_state_row.get("down_bid_depth_top_5")),
-                    _coerce_float(event_state_row.get("down_ask_depth_top_5")),
-                ],
-                default=0.0,
-            ),
-            book_velocity=_nanmean(
-                [
-                    abs(_coerce_float(event_state_row.get("up_book_velocity"), default=0.0) or 0.0),
-                    abs(_coerce_float(event_state_row.get("down_book_velocity"), default=0.0) or 0.0),
-                ],
-                default=0.0,
-            ),
-            spot_vol_multiplier=_coerce_float(event_state_row.get("spot_vol_multiplier"), default=1.0) or 1.0,
         )
 
     def _conditioned_spot_drift(
@@ -486,17 +464,3 @@ def _coerce_float(value: Any, default: float | None = None) -> float | None:
     if not np.isfinite(numeric):
         return default
     return numeric
-
-
-def _nanmean(values: list[float | None], *, default: float) -> float:
-    filtered = [value for value in values if value is not None and np.isfinite(value)]
-    if not filtered:
-        return float(default)
-    return float(np.mean(filtered))
-
-
-def _nanmin(values: list[float | None], *, default: float) -> float:
-    filtered = [value for value in values if value is not None and np.isfinite(value)]
-    if not filtered:
-        return float(default)
-    return float(np.min(filtered))
